@@ -3,6 +3,8 @@ import cv2
 from pyzbar.pyzbar import decode
 import threading
 import time
+import base64
+import numpy as np
 
 def main(page: ft.Page):
     # Configuración de la página
@@ -26,6 +28,16 @@ def main(page: ft.Page):
             cap.release()
             cv2.destroyAllWindows()
         
+        # Elemento para mostrar la cámara
+        camera_display = ft.Image(
+            src_base64=None,
+            width=300,
+            height=300,
+            fit=ft.ImageFit.CONTAIN,
+            border_radius=10,
+            visible=False
+        )
+        
         def start_camera(e):
             nonlocal camera_active, cap
             if not camera_active:
@@ -36,15 +48,21 @@ def main(page: ft.Page):
                         page.show_snack_bar(ft.SnackBar(ft.Text("❌ No se pudo acceder a la cámara")))
                         return
                     
+                    # Configurar resolución para móvil
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                    
                     camera_active = True
                     start_btn.text = "Detener Cámara"
                     start_btn.bgcolor = "#ff4444"
                     status_text.value = "🔍 Escaneando QR... Apunta al código"
                     status_text.color = "#4CAF50"
+                    camera_display.visible = True
                     page.update()
                     
-                    # Iniciar hilo para lectura de QR
-                    threading.Thread(target=read_qr, daemon=True).start()
+                    # Iniciar hilo para mostrar cámara y lectura de QR
+                    threading.Thread(target=update_camera_display, daemon=True).start()
                     
                 except Exception as ex:
                     page.show_snack_bar(ft.SnackBar(ft.Text(f"❌ Error de cámara: {str(ex)}")))
@@ -56,9 +74,10 @@ def main(page: ft.Page):
             start_btn.bgcolor = "#4CAF50"
             status_text.value = "Cámara detenida"
             status_text.color = "gray"
+            camera_display.visible = False
             page.update()
         
-        def read_qr():
+        def update_camera_display():
             nonlocal camera_active
             while camera_active:
                 try:
@@ -66,25 +85,68 @@ def main(page: ft.Page):
                     if not ret:
                         break
                     
-                    # Decodificar QR
-                    decoded_objects = decode(frame)
-                    for obj in decoded_objects:
-                        qr_data = obj.data.decode('utf-8')
-                        print(f"QR detectado: {qr_data}")
-                        
-                        # Detener cámara y procesar QR
-                        stop_camera()
-                        page.show_snack_bar(ft.SnackBar(ft.Text(f"✅ QR detectado: {qr_data}")))
-                        process_qr_data(qr_data)
-                        return
+                    # Redimensionar frame para móvil
+                    frame = cv2.resize(frame, (300, 300))
                     
-                    time.sleep(0.1)
+                    # Dibujar rectángulo de escaneo
+                    height, width = frame.shape[:2]
+                    center_x, center_y = width // 2, height // 2
+                    scan_size = 200
+                    
+                    # Rectángulo de escaneo en el centro
+                    cv2.rectangle(frame, 
+                                (center_x - scan_size//2, center_y - scan_size//2),
+                                (center_x + scan_size//2, center_y + scan_size//2),
+                                (0, 255, 0), 2)
+                    
+                    # Convertir frame a base64 para mostrar en Flet
+                    _, buffer = cv2.imencode('.jpg', frame)
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    
+                    # Actualizar imagen en la UI
+                    camera_display.src_base64 = frame_base64
+                    page.update()
+                    
+                    # Decodificar QR (solo en el área de escaneo)
+                    try:
+                        # Recortar área de escaneo
+                        scan_area = frame[center_y-scan_size//2:center_y+scan_size//2, 
+                                        center_x-scan_size//2:center_x+scan_size//2]
+                        
+                        decoded_objects = decode(scan_area)
+                        for obj in decoded_objects:
+                            qr_data = obj.data.decode('utf-8')
+                            print(f"QR detectado: {qr_data}")
+                            
+                            # Dibujar resultado en el frame
+                            cv2.putText(frame, "✅ QR DETECTADO", (50, 50), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                            
+                            # Actualizar frame final
+                            _, final_buffer = cv2.imencode('.jpg', frame)
+                            final_base64 = base64.b64encode(final_buffer).decode('utf-8')
+                            camera_display.src_base64 = final_base64
+                            page.update()
+                            
+                            # Detener cámara y procesar QR
+                            time.sleep(1)  # Mostrar confirmación por 1 segundo
+                            stop_camera()
+                            page.show_snack_bar(ft.SnackBar(ft.Text(f"✅ QR detectado: {qr_data}")))
+                            process_qr_data(qr_data)
+                            return
+                    
+                    except Exception as qr_error:
+                        print(f"Error en decodificación QR: {qr_error}")
+                    
+                    time.sleep(0.03)  # ~30 FPS
+                    
                 except Exception as ex:
-                    print(f"Error en lectura QR: {ex}")
+                    print(f"Error en actualización de cámara: {ex}")
                     break
         
         # Elementos de la UI
-        status_text = ft.Text("Presiona 'Iniciar Cámara' para escanear QR", size=16, color="gray", text_align=ft.TextAlign.CENTER)
+        status_text = ft.Text("Presiona 'Iniciar Cámara' para escanear QR", 
+                             size=16, color="gray", text_align=ft.TextAlign.CENTER)
         
         start_btn = ft.ElevatedButton(
             "Iniciar Cámara",
@@ -98,10 +160,22 @@ def main(page: ft.Page):
         qr_content = ft.Container(
             content=ft.Column([
                 ft.Icon(ft.Icons.QR_CODE_SCANNER, size=80, color="#4CAF50"),
-                ft.Text("Escanear QR del Carrito", size=22, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER),
+                ft.Text("Escanear QR del Carrito", size=22, weight=ft.FontWeight.BOLD, 
+                       text_align=ft.TextAlign.CENTER),
                 ft.Container(height=10),
                 status_text,
-                ft.Container(height=30),
+                ft.Container(height=20),
+                
+                # Contenedor de la cámara
+                ft.Container(
+                    content=camera_display,
+                    alignment=ft.alignment.center,
+                    bgcolor="#f5f5f5",
+                    border_radius=10,
+                    padding=10,
+                    border=ft.border.all(2, "#e0e0e0")
+                ),
+                ft.Container(height=20),
                 
                 # Botones
                 start_btn,
@@ -121,10 +195,14 @@ def main(page: ft.Page):
                 ], alignment=ft.MainAxisAlignment.CENTER),
                 
                 ft.Container(height=20),
-                ft.Text("Nota: En Android, la app solicitará permisos de cámara automáticamente", 
+                ft.Text("Nota: Apunta el código QR al cuadro verde de escaneo", 
+                       size=12, color="gray", text_align=ft.TextAlign.CENTER),
+                ft.Text("La app solicitará permisos de cámara automáticamente", 
                        size=12, color="gray", text_align=ft.TextAlign.CENTER)
                 
-            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, 
+               alignment=ft.MainAxisAlignment.CENTER,
+               scroll=ft.ScrollMode.ADAPTIVE),
             padding=20,
             alignment=ft.alignment.center,
             expand=True
@@ -145,7 +223,8 @@ def main(page: ft.Page):
             label="Código del carrito",
             hint_text="Ej: CAR12345",
             width=250,
-            autofocus=True
+            autofocus=True,
+            on_submit=submit_code
         )
         
         manual_dialog = ft.AlertDialog(
@@ -166,7 +245,6 @@ def main(page: ft.Page):
     
     def process_qr_data(qr_data):
         """Procesa los datos del QR escaneado"""
-        # Procesar datos del QR
         qr_data_lower = qr_data.lower()
         
         # Verificar si es un QR válido de carrito
@@ -242,76 +320,86 @@ def main(page: ft.Page):
             height=60
         )
         
-        # DRAWER
+        # DRAWER - CORREGIDO PARA FOOTER ABAJO
         page.drawer = ft.NavigationDrawer(
             bgcolor="#2e7d32",
             controls=[
-                # Header del drawer
+                # Contenedor principal que usa SPACE_BETWEEN
                 ft.Container(
-                    content=ft.Row([
-                        ft.Icon(ft.Icons.STORE, color="white", size=30),
-                        ft.Text("Supermercado X", color="white", size=18, weight=ft.FontWeight.BOLD),
-                    ]),
-                    padding=20,
-                    bgcolor="#1b5e20",
-                ),
-                
-                # Items del menú
-                ft.Container(
-                    content=ft.ListTile(
-                        leading=ft.Icon(ft.Icons.HOME, color="white"),
-                        title=ft.Text("Inicio", color="white"),
-                        on_click=menu_item_clicked,
-                        data="Inicio"
+                    content=ft.Column(
+                        controls=[
+                            # Header del drawer
+                            ft.Container(
+                                content=ft.Row([
+                                    ft.Icon(ft.Icons.STORE, color="white", size=30),
+                                    ft.Text("Supermercado X", color="white", size=18, weight=ft.FontWeight.BOLD),
+                                ]),
+                                padding=20,
+                                bgcolor="#1b5e20",
+                            ),
+                            
+                            # Items del menú
+                            ft.Container(
+                                content=ft.ListTile(
+                                    leading=ft.Icon(ft.Icons.HOME, color="white"),
+                                    title=ft.Text("Inicio", color="white"),
+                                    on_click=menu_item_clicked,
+                                    data="Inicio"
+                                ),
+                                bgcolor="#2e7d32",
+                            ),
+                            ft.Container(
+                                content=ft.ListTile(
+                                    leading=ft.Icon(ft.Icons.SHOPPING_BAG, color="white"),
+                                    title=ft.Text("Productos", color="white"),
+                                    on_click=menu_item_clicked,
+                                    data="Productos"
+                                ),
+                                bgcolor="#2e7d32",
+                            ),
+                            ft.Container(
+                                content=ft.ListTile(
+                                    leading=ft.Icon(ft.Icons.LOCAL_OFFER, color="white"),
+                                    title=ft.Text("Ofertas", color="white"),
+                                    on_click=menu_item_clicked,
+                                    data="Ofertas"
+                                ),
+                                bgcolor="#2e7d32",
+                            ),
+                            ft.Container(
+                                content=ft.ListTile(
+                                    leading=ft.Icon(ft.Icons.SHOPPING_CART, color="white"),
+                                    title=ft.Text("Mi Carrito", color="white"),
+                                    on_click=menu_item_clicked,
+                                    data="Mi Carrito"
+                                ),
+                                bgcolor="#2e7d32",
+                            ),
+                            
+                            # Espacio flexible que empuja el footer hacia abajo
+                            ft.Container(expand=True),
+                            
+                            # FOOTER - ahora se pega abajo
+                            ft.Container(
+                                content=ft.Column([
+                                    ft.Divider(color="white"),
+                                    ft.Text("Soporte 24/7", color="white", size=12, weight=ft.FontWeight.BOLD),
+                                    ft.Row([
+                                        ft.Icon(ft.Icons.PHONE, color="white", size=16),
+                                        ft.Text("+1 234 567 890", color="white", size=12),
+                                    ]),
+                                    ft.Container(height=5),
+                                    ft.Text("App Móvil v1.0", color="white", size=10),
+                                ], spacing=5),
+                                padding=10,
+                                bgcolor="#1b5e20",
+                            )
+                        ],
+                        # Esta es la clave: SPACE_BETWEEN distribuye el espacio
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        spacing=0
                     ),
-                    bgcolor="#2e7d32",
-                ),
-                ft.Container(
-                    content=ft.ListTile(
-                        leading=ft.Icon(ft.Icons.SHOPPING_BAG, color="white"),
-                        title=ft.Text("Productos", color="white"),
-                        on_click=menu_item_clicked,
-                        data="Productos"
-                    ),
-                    bgcolor="#2e7d32",
-                ),
-                ft.Container(
-                    content=ft.ListTile(
-                        leading=ft.Icon(ft.Icons.LOCAL_OFFER, color="white"),
-                        title=ft.Text("Ofertas", color="white"),
-                        on_click=menu_item_clicked,
-                        data="Ofertas"
-                    ),
-                    bgcolor="#2e7d32",
-                ),
-                ft.Container(
-                    content=ft.ListTile(
-                        leading=ft.Icon(ft.Icons.SHOPPING_CART, color="white"),
-                        title=ft.Text("Mi Carrito", color="white"),
-                        on_click=menu_item_clicked,
-                        data="Mi Carrito"
-                    ),
-                    bgcolor="#2e7d32",
-                ),
-                
-                # Espacio flexible
-                ft.Container(expand=True),
-                
-                
-                # FOOTER
-                ft.Container(
-                    content=ft.Column([
-                        ft.Divider(color="white"),
-                        ft.Text("Soporte 24/7", color="white", size=12, weight=ft.FontWeight.BOLD),
-                        ft.Row([
-                            ft.Icon(ft.Icons.PHONE, color="white", size=16),
-                            ft.Text("+1 234 567 890", color="white", size=12),
-                        ]),
-                        ft.Container(height=5),
-                        ft.Text("App Móvil v1.0", color="white", size=10),
-                    ], spacing=5),
-                    padding=10,
-                    bgcolor="#1b5e20",
+                    expand=True
                 )
             ],
         )
@@ -458,5 +546,5 @@ def main(page: ft.Page):
     # Iniciar con el lector de QR
     show_qr_reader()
 
-# Ejecutar sin el parámetro permissions
+# Ejecutar la aplicación
 ft.app(target=main)
