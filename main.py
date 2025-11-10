@@ -30,7 +30,6 @@ def main(page: ft.Page):
                 cv2.destroyAllWindows()
         
         show_main_app()
-        
     
     def show_qr_reader():
         nonlocal current_view, camera_active, cap
@@ -205,7 +204,7 @@ def main(page: ft.Page):
                     ft.TextButton(
                         "Demo Rápida",
                         icon=ft.Icons.FLASH_ON,
-                        on_click=login_successful()
+                        on_click=lambda e: login_successful()  # CORREGIDO: usar lambda
                     )
                 ], alignment=ft.MainAxisAlignment.CENTER),
                 
@@ -269,8 +268,6 @@ def main(page: ft.Page):
         else:
             page.show_snack_bar(ft.SnackBar(ft.Text("❌ QR no válido. Debe ser de un carrito.")))
     
-    
-        
     def logout(e):
         nonlocal current_view
         current_view = "qr_reader"
@@ -291,9 +288,11 @@ def main(page: ft.Page):
         if item == "Escaner de Productos":
             page.show_snack_bar(ft.SnackBar(ft.Text("Escáner de productos - Próximamente")))
         elif item == "Mi Carrito":
-            show_cart()  # ← NUEVA LÍNEA
+            show_cart()
         elif item == "Inicio":
             show_main_app()
+        elif item == "Cerrar Sesión":
+            logout(None)
         else:
             page.show_snack_bar(ft.SnackBar(ft.Text(f"Seleccionado: {item}")))
 
@@ -321,7 +320,6 @@ def main(page: ft.Page):
                     ft.IconButton(
                         icon=ft.Icons.SHOPPING_CART,
                         icon_color="white",
-                        title=ft.Text("Carrito", color="white"),
                         on_click=show_cart,
                         tooltip="Mi Carrito"
                     )
@@ -334,98 +332,38 @@ def main(page: ft.Page):
             height=60
         )
         
-        # DRAWER - CORREGIDO PARA FOOTER ABAJO
+        # DRAWER - SIMPLIFICADO Y FUNCIONAL
         page.drawer = ft.NavigationDrawer(
-            bgcolor="#2e7d32",
             controls=[
-                # Contenedor principal que usa SPACE_BETWEEN
-                ft.Container(
-                    content=ft.Column(
-                        controls=[
-                            # Header del drawer
-                            ft.Container(
-                                content=ft.Row([
-                                    ft.Icon(ft.Icons.STORE, color="white", size=30),
-                                    ft.Text("Supermercado X", color="white", size=18, weight=ft.FontWeight.BOLD),
-                                ]),
-                                padding=20,
-                                bgcolor="#1b5e20",
-                            ),
-                            
-                            # Items del menú
-                            ft.Container(
-                                content=ft.ListTile(
-                                    leading=ft.Icon(ft.Icons.HOME, color="white"),
-                                    title=ft.Text("Inicio", color="white"),
-                                    on_click=menu_item_clicked,
-                                    data="Inicio"
-                                ),
-                                bgcolor="#2e7d32",
-                            ),
-                            ft.Container(
-                                content=ft.ListTile(
-                                    leading=ft.Icon(ft.Icons.SHOPPING_CART, color="white"),
-                                    title=ft.Text("Mi Carrito", color="white"),
-                                    on_click=show_cart,
-                                    data="Mi Carrito"
-                                ),
-                                bgcolor="#2e7d32",
-                            ),
-                            ft.Container(
-                                content=ft.ListTile(
-                                    leading=ft.Icon(ft.Icons.BARCODE_READER, color="white"),
-                                    title=ft.Text("Escaner de Productos", color="white"),
-                                    on_click=menu_item_clicked,
-                                    data="Escaner de Productos"
-                                ),
-                                bgcolor="#2e7d32",
-                            ),
-                            ft.Container(
-                                content=ft.ListTile(
-                                    leading=ft.Icon(ft.Icons.SHOPPING_BAG, color="white"),
-                                    title=ft.Text("Productos", color="white"),
-                                    on_click=menu_item_clicked,
-                                    data="Productos"
-                                ),
-                                bgcolor="#2e7d32",
-                            ),
-                            
-                            
-                            ft.Container(
-                                content=ft.ListTile(
-                                    leading=ft.Icon(ft.Icons.CLOSE, color="white"),
-                                    title=ft.Text("Cerrar", color="white"),
-                                    on_click=lambda e: setattr(page.drawer, 'open', False) or page.update(),
-                                ),
-                                 bgcolor="#2e7d32",
-                            ),
-                            # Espacio flexible que empuja el footer hacia abajo
-                            ft.Container(expand=True),
-                            
-                            # FOOTER - ahora se pega abajo
-                            ft.Container(
-                                content=ft.Column([
-                                    ft.Divider(color="white"),
-                                    ft.Text("Soporte 24/7", color="white", size=12, weight=ft.FontWeight.BOLD),
-                                    ft.Row([
-                                        ft.Icon(ft.Icons.PHONE, color="white", size=16),
-                                        ft.Text("+1 234 567 890", color="white", size=12),
-                                    ]),
-                                    ft.Container(height=5),
-                                    ft.Text("App Móvil v1.0", color="white", size=10),
-                                ], spacing=5),
-                                padding=10,
-                                bgcolor="#1b5e20",
-                            )
-                        ],
-                        # Esta es la clave: SPACE_BETWEEN distribuye el espacio
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        spacing=0
-                    ),
-                    expand=True
-                )
+                ft.NavigationDrawerDestination(
+                    icon=ft.Icons.HOME,
+                    label="Inicio",
+                ),
+                ft.NavigationDrawerDestination(
+                    icon=ft.Icons.SHOPPING_CART,
+                    label="Mi Carrito",
+                ),
+                ft.NavigationDrawerDestination(
+                    icon=ft.Icons.BARCODE_READER,
+                    label="Escaner de Productos",
+                ),
+                ft.NavigationDrawerDestination(
+                    icon=ft.Icons.SHOPPING_BAG,
+                    label="Productos",
+                ),
+                ft.Divider(),
+                ft.NavigationDrawerDestination(
+                    icon=ft.Icons.LOGOUT,
+                    label="Cerrar Sesión",
+                ),
             ],
+            on_change=lambda e: menu_item_clicked_wrapper(e.control.selected_index)
         )
+        
+        def menu_item_clicked_wrapper(selected_index):
+            items = ["Inicio", "Mi Carrito", "Escaner de Productos", "Productos", "Cerrar Sesión"]
+            if 0 <= selected_index < len(items):
+                menu_item_clicked(type('Event', (), {'control': type('Control', (), {'data': items[selected_index]})()}))
         
         # CONTENIDO PRINCIPAL
         frame1 = ft.Container(
@@ -595,9 +533,23 @@ def main(page: ft.Page):
                 ft.Icon(ft.Icons.SHOPPING_CART_OUTLINED, size=100, color="gray"),
                 ft.Text("Carrito vacío", size=18, color="gray"),
                 ft.Text("Escanea productos para agregarlos", size=14, color="gray"),
+                ft.ElevatedButton(
+                    "Volver al Inicio",
+                    on_click=lambda e: show_main_app(),
+                    bgcolor="#4CAF50",
+                    color="white"
+                )
             ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, expand=True)
         else:
-            contenido = ft.Text("Productos en el carrito...", size=16)
+            contenido = ft.Column([
+                ft.Text(f"Tienes {len(shopping_cart)} productos en el carrito", size=16),
+                ft.ElevatedButton(
+                    "Seguir Comprando",
+                    on_click=lambda e: show_main_app(),
+                    bgcolor="#4CAF50",
+                    color="white"
+                )
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, expand=True)
         
         page.add(ft.Column([header, contenido], expand=True))
 
@@ -605,9 +557,9 @@ def main(page: ft.Page):
         shopping_cart.clear()
         page.show_snack_bar(ft.SnackBar(ft.Text("Carrito vaciado")))
         show_cart()
+    
     # Iniciar con el lector de QR
     show_qr_reader()
-        
-        
+    
 # Ejecutar la aplicación
 ft.app(target=main)
