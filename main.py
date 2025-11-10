@@ -16,6 +16,21 @@ def main(page: ft.Page):
     current_view = "qr_reader"
     camera_active = False
     cap = None
+    shopping_cart = []
+    
+    def login_successful(e=None):
+        nonlocal current_view, camera_active, cap
+        current_view = "main_app"
+        
+        # Detener cámara si está activa
+        if camera_active:
+            camera_active = False
+            if cap is not None:
+                cap.release()
+                cv2.destroyAllWindows()
+        
+        show_main_app()
+        
     
     def show_qr_reader():
         nonlocal current_view, camera_active, cap
@@ -190,7 +205,7 @@ def main(page: ft.Page):
                     ft.TextButton(
                         "Demo Rápida",
                         icon=ft.Icons.FLASH_ON,
-                        on_click=login_successful
+                        on_click=login_successful()
                     )
                 ], alignment=ft.MainAxisAlignment.CENTER),
                 
@@ -254,19 +269,8 @@ def main(page: ft.Page):
         else:
             page.show_snack_bar(ft.SnackBar(ft.Text("❌ QR no válido. Debe ser de un carrito.")))
     
-    def login_successful(e=None):
-        nonlocal current_view, camera_active, cap
-        current_view = "main_app"
-        
-        # Detener cámara si está activa
-        if camera_active:
-            camera_active = False
-            if cap is not None:
-                cap.release()
-                cv2.destroyAllWindows()
-        
-        show_main_app()
     
+        
     def logout(e):
         nonlocal current_view
         current_view = "qr_reader"
@@ -280,9 +284,18 @@ def main(page: ft.Page):
         page.update()
     
     def menu_item_clicked(e):
-        page.show_snack_bar(ft.SnackBar(ft.Text(f"Seleccionado: {e.control.data}")))
+        item = e.control.data
         page.drawer.open = False
         page.update()
+        
+        if item == "Escaner de Productos":
+            page.show_snack_bar(ft.SnackBar(ft.Text("Escáner de productos - Próximamente")))
+        elif item == "Mi Carrito":
+            show_cart()  # ← NUEVA LÍNEA
+        elif item == "Inicio":
+            show_main_app()
+        else:
+            page.show_snack_bar(ft.SnackBar(ft.Text(f"Seleccionado: {item}")))
 
     def show_main_app():
         page.controls.clear()
@@ -308,8 +321,9 @@ def main(page: ft.Page):
                     ft.IconButton(
                         icon=ft.Icons.SHOPPING_CART,
                         icon_color="white",
-                        on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Carrito abierto"))),
-                        tooltip="Carrito"
+                        title=ft.Text("Carrito", color="white"),
+                        on_click=show_cart,
+                        tooltip="Mi Carrito"
                     )
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -350,6 +364,24 @@ def main(page: ft.Page):
                             ),
                             ft.Container(
                                 content=ft.ListTile(
+                                    leading=ft.Icon(ft.Icons.SHOPPING_CART, color="white"),
+                                    title=ft.Text("Mi Carrito", color="white"),
+                                    on_click=show_cart,
+                                    data="Mi Carrito"
+                                ),
+                                bgcolor="#2e7d32",
+                            ),
+                            ft.Container(
+                                content=ft.ListTile(
+                                    leading=ft.Icon(ft.Icons.BARCODE_READER, color="white"),
+                                    title=ft.Text("Escaner de Productos", color="white"),
+                                    on_click=menu_item_clicked,
+                                    data="Escaner de Productos"
+                                ),
+                                bgcolor="#2e7d32",
+                            ),
+                            ft.Container(
+                                content=ft.ListTile(
                                     leading=ft.Icon(ft.Icons.SHOPPING_BAG, color="white"),
                                     title=ft.Text("Productos", color="white"),
                                     on_click=menu_item_clicked,
@@ -357,25 +389,16 @@ def main(page: ft.Page):
                                 ),
                                 bgcolor="#2e7d32",
                             ),
-                            ft.Container(
-                                content=ft.ListTile(
-                                    leading=ft.Icon(ft.Icons.LOCAL_OFFER, color="white"),
-                                    title=ft.Text("Ofertas", color="white"),
-                                    on_click=menu_item_clicked,
-                                    data="Ofertas"
-                                ),
-                                bgcolor="#2e7d32",
-                            ),
-                            ft.Container(
-                                content=ft.ListTile(
-                                    leading=ft.Icon(ft.Icons.SHOPPING_CART, color="white"),
-                                    title=ft.Text("Mi Carrito", color="white"),
-                                    on_click=menu_item_clicked,
-                                    data="Mi Carrito"
-                                ),
-                                bgcolor="#2e7d32",
-                            ),
                             
+                            
+                            ft.Container(
+                                content=ft.ListTile(
+                                    leading=ft.Icon(ft.Icons.CLOSE, color="white"),
+                                    title=ft.Text("Cerrar", color="white"),
+                                    on_click=lambda e: setattr(page.drawer, 'open', False) or page.update(),
+                                ),
+                                 bgcolor="#2e7d32",
+                            ),
                             # Espacio flexible que empuja el footer hacia abajo
                             ft.Container(expand=True),
                             
@@ -543,8 +566,48 @@ def main(page: ft.Page):
             )
         )
 
+    def show_cart(e=None):
+        page.controls.clear()
+        
+        # Header
+        header = ft.Container(
+            content=ft.Row([
+                ft.IconButton(
+                    icon=ft.Icons.ARROW_BACK, 
+                    icon_color="white", 
+                    on_click=lambda _: show_main_app()
+                ),
+                ft.Text("Mi Carrito", size=20, weight=ft.FontWeight.BOLD, color="white", expand=True, text_align=ft.TextAlign.CENTER),
+                ft.IconButton(
+                    icon=ft.Icons.DELETE, 
+                    icon_color="white", 
+                    on_click=lambda _: vaciar_carrito()
+                ),
+            ]),
+            bgcolor="#4CAF50",
+            padding=10,
+            height=60
+        )
+        
+        # Contenido del carrito
+        if not shopping_cart:
+            contenido = ft.Column([
+                ft.Icon(ft.Icons.SHOPPING_CART_OUTLINED, size=100, color="gray"),
+                ft.Text("Carrito vacío", size=18, color="gray"),
+                ft.Text("Escanea productos para agregarlos", size=14, color="gray"),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, expand=True)
+        else:
+            contenido = ft.Text("Productos en el carrito...", size=16)
+        
+        page.add(ft.Column([header, contenido], expand=True))
+
+    def vaciar_carrito():
+        shopping_cart.clear()
+        page.show_snack_bar(ft.SnackBar(ft.Text("Carrito vaciado")))
+        show_cart()
     # Iniciar con el lector de QR
     show_qr_reader()
-
+        
+        
 # Ejecutar la aplicación
 ft.app(target=main)
