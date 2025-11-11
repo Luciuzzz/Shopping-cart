@@ -204,7 +204,7 @@ def main(page: ft.Page):
                     ft.TextButton(
                         "Demo Rápida",
                         icon=ft.Icons.FLASH_ON,
-                        on_click=lambda e: login_successful()  # CORREGIDO: usar lambda
+                        on_click=lambda e: login_successful()
                     )
                 ], alignment=ft.MainAxisAlignment.CENTER),
                 
@@ -286,7 +286,7 @@ def main(page: ft.Page):
         page.update()
         
         if item == "Escaner de Productos":
-            page.show_snack_bar(ft.SnackBar(ft.Text("Escáner de productos - Próximamente")))
+            show_barcode_scanner()
         elif item == "Mi Carrito":
             show_cart()
         elif item == "Inicio":
@@ -384,7 +384,7 @@ def main(page: ft.Page):
                         "Comenzar a Comprar",
                         bgcolor="white",
                         color="#4CAF50",
-                        on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Navegando a productos")))
+                        on_click=lambda e: show_barcode_scanner()
                     )
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -504,6 +504,399 @@ def main(page: ft.Page):
             )
         )
 
+    def show_barcode_scanner(e=None):
+        """Muestra el escáner de código de barras"""
+        nonlocal camera_active, cap, current_view
+        current_view = "barcode_scanner"
+        page.controls.clear()
+        camera_active = False
+        
+        # Detener cámara si estaba activa
+        if cap is not None:
+            cap.release()
+            cv2.destroyAllWindows()
+        
+        # Elemento para mostrar la cámara
+        camera_display = ft.Image(
+            src_base64=None,
+            width=350,
+            height=300,
+            fit=ft.ImageFit.CONTAIN,
+            border_radius=10,
+            visible=False
+        )
+        
+        # Lista de productos escaneados
+        scanned_products = ft.Column(
+            scroll=ft.ScrollMode.ADAPTIVE,
+            expand=True
+        )
+        
+        # Base de datos simulada de productos
+        product_database = {
+            "123456789012": {"nombre": "Leche Entera 1L", "precio": 2.50, "categoria": "Lácteos"},
+            "234567890123": {"nombre": "Pan Integral", "precio": 1.80, "categoria": "Panadería"},
+            "345678901234": {"nombre": "Arroz 1kg", "precio": 3.20, "categoria": "Despensa"},
+            "456789012345": {"nombre": "Agua Mineral 500ml", "precio": 1.00, "categoria": "Bebidas"},
+            "567890123456": {"nombre": "Jabón Líquido", "precio": 4.50, "categoria": "Limpieza"},
+            "678901234567": {"nombre": "Cereal Maíz", "precio": 3.80, "categoria": "Despensa"},
+            "789012345678": {"nombre": "Yogurt Natural", "precio": 2.20, "categoria": "Lácteos"},
+            "890123456789": {"nombre": "Galletas Chocolate", "precio": 2.80, "categoria": "Snacks"},
+            "901234567890": {"nombre": "Aceite Oliva 500ml", "precio": 6.50, "categoria": "Despensa"},
+            "012345678901": {"nombre": "Refresco Cola 330ml", "precio": 1.50, "categoria": "Bebidas"}
+        }
+        
+        def start_barcode_scan(e):
+            nonlocal camera_active, cap
+            if not camera_active:
+                try:
+                    # Intentar abrir cámara
+                    cap = cv2.VideoCapture(0)
+                    if not cap.isOpened():
+                        page.show_snack_bar(ft.SnackBar(ft.Text("❌ No se pudo acceder a la cámara")))
+                        return
+                    
+                    # Configurar resolución
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                    
+                    camera_active = True
+                    start_btn.text = "Detener Escaneo"
+                    start_btn.bgcolor = "#ff4444"
+                    status_text.value = "🔍 Escaneando códigos de barras..."
+                    status_text.color = "#2196F3"
+                    camera_display.visible = True
+                    page.update()
+                    
+                    # Iniciar hilo para mostrar cámara y lectura de códigos de barras
+                    threading.Thread(target=update_barcode_display, daemon=True).start()
+                    
+                except Exception as ex:
+                    page.show_snack_bar(ft.SnackBar(ft.Text(f"❌ Error de cámara: {str(ex)}")))
+            else:
+                stop_barcode_scan()
+        
+        def stop_barcode_scan():
+            nonlocal camera_active
+            camera_active = False
+            start_btn.text = "Iniciar Escaneo"
+            start_btn.bgcolor = "#2196F3"
+            status_text.value = "Escáner detenido"
+            status_text.color = "gray"
+            camera_display.visible = False
+            page.update()
+        
+        def update_barcode_display():
+            nonlocal camera_active
+            last_scanned_time = 0
+            scan_cooldown = 2  # segundos entre escaneos
+            
+            while camera_active:
+                try:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # Redimensionar frame
+                    frame = cv2.resize(frame, (350, 300))
+                    
+                    # Dibujar línea de escaneo en el centro
+                    height, width = frame.shape[:2]
+                    cv2.line(frame, (0, height//2), (width, height//2), (0, 255, 0), 2)
+                    
+                    # Convertir frame a base64 para mostrar en Flet
+                    _, buffer = cv2.imencode('.jpg', frame)
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    
+                    # Actualizar imagen en la UI
+                    camera_display.src_base64 = frame_base64
+                    
+                    # Decodificar códigos de barras
+                    current_time = time.time()
+                    if current_time - last_scanned_time > scan_cooldown:
+                        try:
+                            decoded_objects = decode(frame)
+                            for obj in decoded_objects:
+                                barcode_data = obj.data.decode('utf-8')
+                                print(f"Código de barras detectado: {barcode_data}")
+                                
+                                # Dibujar resultado en el frame
+                                cv2.putText(frame, "✅ PRODUCTO DETECTADO", (30, 30), 
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                
+                                # Actualizar frame final
+                                _, final_buffer = cv2.imencode('.jpg', frame)
+                                final_base64 = base64.b64encode(final_buffer).decode('utf-8')
+                                camera_display.src_base64 = final_base64
+                                
+                                # Procesar código de barras
+                                process_barcode(barcode_data)
+                                last_scanned_time = current_time
+                                break
+                        
+                        except Exception as barcode_error:
+                            print(f"Error en decodificación: {barcode_error}")
+                    
+                    page.update()
+                    time.sleep(0.03)  # ~30 FPS
+                    
+                except Exception as ex:
+                    print(f"Error en actualización de cámara: {ex}")
+                    break
+        
+        def process_barcode(barcode_data):
+            """Procesa el código de barras escaneado"""
+            if barcode_data in product_database:
+                product = product_database[barcode_data]
+                
+                # Verificar si el producto ya está en el carrito
+                existing_item = next((item for item in shopping_cart if item["codigo"] == barcode_data), None)
+                
+                if existing_item:
+                    existing_item["cantidad"] += 1
+                else:
+                    # Agregar producto al carrito
+                    shopping_cart.append({
+                        "codigo": barcode_data,
+                        "nombre": product["nombre"],
+                        "precio": product["precio"],
+                        "cantidad": 1
+                    })
+                
+                # Mostrar notificación
+                page.show_snack_bar(ft.SnackBar(
+                    ft.Text(f"✅ {product['nombre']} - ${product['precio']} agregado al carrito")
+                ))
+                
+                # Actualizar lista de productos escaneados
+                update_scanned_products_list()
+                
+            else:
+                page.show_snack_bar(ft.SnackBar(
+                    ft.Text(f"❌ Producto no encontrado: {barcode_data}")
+                ))
+        
+        def update_scanned_products_list():
+            """Actualiza la lista de productos escaneados"""
+            scanned_products.controls.clear()
+            
+            if shopping_cart:
+                total = 0
+                for item in shopping_cart:
+                    product_card = ft.Card(
+                        content=ft.Container(
+                            content=ft.Column([
+                                ft.Row([
+                                    ft.Text(item["nombre"], size=16, weight=ft.FontWeight.BOLD, expand=True),
+                                    ft.Text(f"${item['precio']:.2f}", size=16, color="green"),
+                                ]),
+                                ft.Row([
+                                    ft.Text(f"Código: {item['codigo']}", size=12, color="gray"),
+                                    ft.Text(f"Cantidad: x{item['cantidad']}", size=14),
+                                ])
+                            ]),
+                            padding=10
+                        ),
+                        margin=5
+                    )
+                    scanned_products.controls.append(product_card)
+                    total += item["precio"] * item["cantidad"]
+                
+                # Agregar total
+                scanned_products.controls.append(
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Text("Total:", size=18, weight=ft.FontWeight.BOLD),
+                            ft.Text(f"${total:.2f}", size=18, color="green", weight=ft.FontWeight.BOLD),
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        padding=10,
+                        bgcolor="#e8f5e8",
+                        border_radius=5
+                    )
+                )
+            else:
+                scanned_products.controls.append(
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Icon(ft.Icons.SCANNER, size=50, color="gray"),
+                            ft.Text("No hay productos escaneados", size=16, color="gray"),
+                            ft.Text("Escanea códigos de barras para agregar productos", size=14, color="gray"),
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        padding=20,
+                        alignment=ft.alignment.center
+                    )
+                )
+            
+            page.update()
+        
+        def manual_add_product(e):
+            """Agregar producto manualmente"""
+            def submit_manual(e):
+                barcode = manual_code_field.value.strip()
+                if barcode:
+                    process_barcode(barcode)
+                    page.close(manual_dialog)
+                else:
+                    page.show_snack_bar(ft.SnackBar(ft.Text("❌ Ingresa un código válido")))
+            
+            manual_code_field = ft.TextField(
+                label="Código de barras",
+                hint_text="Ej: 123456789012",
+                width=250,
+                autofocus=True,
+                on_submit=submit_manual
+            )
+            
+            manual_dialog = ft.AlertDialog(
+                title=ft.Text("Agregar Producto Manualmente"),
+                content=ft.Column([
+                    ft.Text("Ingresa el código de barras del producto:"),
+                    ft.Container(height=10),
+                    manual_code_field,
+                    ft.Container(height=10),
+                    ft.Text("Códigos de ejemplo:", size=12, color="gray"),
+                    ft.Text("123456789012 - Leche", size=12, color="gray"),
+                    ft.Text("234567890123 - Pan", size=12, color="gray"),
+                ], tight=True),
+                actions=[
+                    ft.TextButton("Cancelar", on_click=lambda e: page.close(manual_dialog)),
+                    ft.ElevatedButton("Agregar", on_click=submit_manual, bgcolor="#2196F3")
+                ],
+                actions_alignment=ft.MainAxisAlignment.END
+            )
+            
+            page.open(manual_dialog)
+        
+        # Elementos de la UI
+        status_text = ft.Text("Presiona 'Iniciar Escaneo' para escanear productos", 
+                             size=16, color="gray", text_align=ft.TextAlign.CENTER)
+        
+        start_btn = ft.ElevatedButton(
+            "Iniciar Escaneo",
+            icon=ft.Icons.CAMERA_ALT,
+            on_click=start_barcode_scan,
+            bgcolor="#2196F3",
+            color="white",
+            width=200
+        )
+        
+        # Header
+        header = ft.Container(
+            content=ft.Row([
+                ft.IconButton(
+                    icon=ft.Icons.ARROW_BACK, 
+                    icon_color="white", 
+                    on_click=lambda _: show_main_app()
+                ),
+                ft.Text("Escáner de Productos", size=20, weight=ft.FontWeight.BOLD, color="white", expand=True, text_align=ft.TextAlign.CENTER),
+                ft.Container(
+                    content=ft.Row([
+                        ft.Icon(ft.Icons.SHOPPING_CART, color="white", size=20),
+                        ft.Container(
+                            content=ft.Text(str(len(shopping_cart)), color="white", size=12, weight=ft.FontWeight.BOLD),
+                            bgcolor="#ff4444",
+                            border_radius=10,
+                            padding=ft.padding.symmetric(horizontal=6, vertical=2)
+                        )
+                    ]),
+                    on_click=show_cart,
+                    tooltip="Ver Carrito"
+                )
+            ]),
+            bgcolor="#2196F3",
+            padding=10,
+            height=60
+        )
+        
+        # Contenido principal
+        scanner_content = ft.Container(
+            content=ft.Column([
+                # Sección del escáner
+                ft.Container(
+                    content=ft.Column([
+                        ft.Icon(ft.Icons.BARCODE_READER, size=60, color="#2196F3"),
+                        ft.Text("Escáner de Códigos de Barras", size=22, weight=ft.FontWeight.BOLD, 
+                               text_align=ft.TextAlign.CENTER),
+                        ft.Container(height=10),
+                        status_text,
+                        ft.Container(height=20),
+                        
+                        # Contenedor de la cámara
+                        ft.Container(
+                            content=camera_display,
+                            alignment=ft.alignment.center,
+                            bgcolor="#f5f5f5",
+                            border_radius=10,
+                            padding=10,
+                            border=ft.border.all(2, "#e0e0e0")
+                        ),
+                        ft.Container(height=20),
+                        
+                        # Botones de control
+                        ft.Row([
+                            start_btn,
+                        ], alignment=ft.MainAxisAlignment.CENTER),
+                        
+                        ft.Container(height=10),
+                        ft.Row([
+                            ft.TextButton(
+                                "Agregar Manualmente",
+                                icon=ft.Icons.KEYBOARD,
+                                on_click=manual_add_product
+                            ),
+                            ft.TextButton(
+                                "Limpiar Lista",
+                                icon=ft.Icons.CLEAR_ALL,
+                                on_click=lambda e: (shopping_cart.clear(), update_scanned_products_list())
+                            )
+                        ], alignment=ft.MainAxisAlignment.CENTER),
+                        
+                        ft.Container(height=20),
+                        ft.Text("Nota: Apunta el código de barras a la línea verde de escaneo", 
+                               size=12, color="gray", text_align=ft.TextAlign.CENTER),
+                    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                    padding=20
+                ),
+                
+                # Lista de productos escaneados
+                ft.Container(
+                    content=ft.Column([
+                        ft.Row([
+                            ft.Text("Productos Escaneados", size=18, weight=ft.FontWeight.BOLD, expand=True),
+                            ft.Container(
+                                content=ft.Text(str(len(shopping_cart)), color="white", size=14, weight=ft.FontWeight.BOLD),
+                                bgcolor="#2196F3",
+                                border_radius=15,
+                                padding=ft.padding.symmetric(horizontal=8, vertical=4)
+                            )
+                        ]),
+                        ft.Container(height=10),
+                        scanned_products
+                    ]),
+                    padding=20,
+                    bgcolor="white",
+                    expand=True
+                )
+                
+            ], scroll=ft.ScrollMode.ADAPTIVE),
+            expand=True
+        )
+        
+        # Inicializar lista de productos
+        update_scanned_products_list()
+        
+        page.add(
+            ft.Column(
+                controls=[
+                    header,
+                    scanner_content
+                ],
+                expand=True,
+                spacing=0
+            )
+        )
+
     def show_cart(e=None):
         page.controls.clear()
         
@@ -534,24 +927,89 @@ def main(page: ft.Page):
                 ft.Text("Carrito vacío", size=18, color="gray"),
                 ft.Text("Escanea productos para agregarlos", size=14, color="gray"),
                 ft.ElevatedButton(
-                    "Volver al Inicio",
-                    on_click=lambda e: show_main_app(),
-                    bgcolor="#4CAF50",
+                    "Ir al Escáner",
+                    on_click=lambda e: show_barcode_scanner(),
+                    bgcolor="#2196F3",
                     color="white"
                 )
             ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, expand=True)
         else:
+            total = sum(item["precio"] * item["cantidad"] for item in shopping_cart)
             contenido = ft.Column([
-                ft.Text(f"Tienes {len(shopping_cart)} productos en el carrito", size=16),
-                ft.ElevatedButton(
-                    "Seguir Comprando",
-                    on_click=lambda e: show_main_app(),
-                    bgcolor="#4CAF50",
-                    color="white"
+                ft.ListView(
+                    controls=[
+                        ft.Card(
+                            content=ft.Container(
+                                content=ft.Column([
+                                    ft.Row([
+                                        ft.Text(item["nombre"], size=16, weight=ft.FontWeight.BOLD, expand=True),
+                                        ft.Text(f"${item['precio']:.2f}", size=16, color="green"),
+                                    ]),
+                                    ft.Row([
+                                        ft.Text(f"Código: {item['codigo']}", size=12, color="gray"),
+                                        ft.Text(f"Cantidad: x{item['cantidad']}", size=14),
+                                        ft.Row([
+                                            ft.IconButton(
+                                                icon=ft.Icons.REMOVE,
+                                                icon_size=16,
+                                                on_click=lambda e, code=item['codigo']: modificar_cantidad(code, -1)
+                                            ),
+                                            ft.IconButton(
+                                                icon=ft.Icons.ADD,
+                                                icon_size=16,
+                                                on_click=lambda e, code=item['codigo']: modificar_cantidad(code, 1)
+                                            ),
+                                        ])
+                                    ])
+                                ]),
+                                padding=10
+                            ),
+                            margin=5
+                        ) for item in shopping_cart
+                    ],
+                    expand=True
+                ),
+                ft.Container(
+                    content=ft.Column([
+                        ft.Divider(),
+                        ft.Row([
+                            ft.Text("Total:", size=20, weight=ft.FontWeight.BOLD),
+                            ft.Text(f"${total:.2f}", size=20, color="green", weight=ft.FontWeight.BOLD),
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        ft.Container(height=20),
+                        ft.Row([
+                            ft.ElevatedButton(
+                                "Seguir Comprando",
+                                on_click=lambda e: show_barcode_scanner(),
+                                bgcolor="#2196F3",
+                                color="white",
+                                expand=True
+                            ),
+                            ft.ElevatedButton(
+                                "Pagar",
+                                on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Funcionalidad de pago - Próximamente"))),
+                                bgcolor="#4CAF50",
+                                color="white",
+                                expand=True
+                            ),
+                        ], spacing=10)
+                    ]),
+                    padding=20,
+                    bgcolor="#f5f5f5"
                 )
-            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, expand=True)
+            ])
         
         page.add(ft.Column([header, contenido], expand=True))
+
+    def modificar_cantidad(codigo, cambio):
+        """Modifica la cantidad de un producto en el carrito"""
+        for item in shopping_cart:
+            if item["codigo"] == codigo:
+                item["cantidad"] += cambio
+                if item["cantidad"] <= 0:
+                    shopping_cart.remove(item)
+                break
+        show_cart()
 
     def vaciar_carrito():
         shopping_cart.clear()
