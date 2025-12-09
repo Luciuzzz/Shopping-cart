@@ -1,1023 +1,970 @@
 import flet as ft
+import sqlite3
+from pathlib import Path
+import threading
 import cv2
 from pyzbar.pyzbar import decode
-import threading
-import time
+import datetime
 import base64
-import numpy as np
+import time
+
+
+# ================== CAPA DE DATOS (SQLite) ==================
+
+
+class Database:
+    def __init__(self, db_path: str | None = None):
+        # Usa ./database/supermarket.db
+        if db_path is None:
+            base_dir = Path(__file__).resolve().parent / "database"
+            base_dir.mkdir(parents=True, exist_ok=True)
+            self.db_path = base_dir / "supermarket.db"
+        else:
+            self.db_path = Path(db_path)
+
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_schema_and_seed(self):
+        """
+        NO tocamos tus tablas grandes (usuarios, cajas, productos, ventas, etc.).
+        Solo aseguramos que existan users/cash_registers/carts/cart_items para el carrito móvil.
+        """
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+
+            # Tabla de usuarios (para el sistema móvil)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL,
+                    full_name TEXT,
+                    user_type TEXT NOT NULL CHECK(user_type IN ('admin','empleado','caja')),
+                    active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+
+            # Tabla de cajas (móvil)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cash_registers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    numero INTEGER NOT NULL,
+                    nombre TEXT NOT NULL,
+                    ubicacion TEXT,
+                    qr_token TEXT UNIQUE NOT NULL,
+                    cashier_user_id INTEGER NOT NULL,
+                    estado TEXT NOT NULL DEFAULT 'activa',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(cashier_user_id) REFERENCES users(id)
+                )
+                """
+            )
+
+            # Carritos
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS carts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cashier_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    FOREIGN KEY(cashier_id) REFERENCES cash_registers(id)
+                )
+                """
+            )
+
+            # Ítems de carrito
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cart_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cart_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    unit_price REAL NOT NULL,
+                    FOREIGN KEY(cart_id) REFERENCES carts(id)
+                )
+                """
+            )
+            # NOTA: el FK a productos no lo forzamos para evitar conflictos con tu esquema.
+
+            # Seed mínimo de users/cash_registers solo si está vacío
+            cur.execute("SELECT COUNT(*) AS c FROM users")
+            if cur.fetchone()["c"] == 0:
+                # Usuarios de prueba para el módulo móvil
+                cur.execute(
+                    "INSERT INTO users (username, password, full_name, user_type) VALUES (?,?,?,?)",
+                    ("admin", "admin123", "Administrador Principal", "admin"),
+                )
+                cur.execute(
+                    "INSERT INTO users (username, password, full_name, user_type) VALUES (?,?,?,?)",
+                    ("empleado1", "empleado123", "Empleado 1", "empleado"),
+                )
+                cur.execute(
+                    "INSERT INTO users (username, password, full_name, user_type) VALUES (?,?,?,?)",
+                    ("caja1", "caja123", "Caja Principal", "caja"),
+                )
+
+                # Obtener id de usuario caja1
+                cur.execute("SELECT id FROM users WHERE username = ?", ("caja1",))
+                caja_user_id = cur.fetchone()["id"]
+
+                # Caja móvil con QR
+                cur.execute(
+                    """
+                    INSERT INTO cash_registers (numero, nombre, ubicacion, qr_token, cashier_user_id)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        1,
+                        "Caja Móvil 1",
+                        "Entrada Principal - Pasillo 1",
+                        "CAJA1-SUPER-TOKEN-ABC123XYZ789",
+                        caja_user_id,
+                    ),
+                )
+
+            conn.commit()
+
+    # ---- Cajas / QR (tabla cash_registers del módulo móvil) ----
+    def get_cash_register_by_qr(self, qr_token: str):
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT * FROM cash_registers WHERE qr_token = ? AND estado = 'activa'",
+                (qr_token,),
+            )
+            return cur.fetchone()
+
+    # ---- Productos (usando tu tabla productos) ----
+
+    def get_product_by_barcode(self, barcode: str):
+        """
+        Lee de la tabla productos:
+        - codigo_barr
+        - descripcion
+        - precio_venta
+        - imagen_url
+        y devuelve alias compatibles.
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                SELECT
+                    id,
+                    descripcion AS name,
+                    descripcion AS description,
+                    codigo_barr AS barcode,
+                    precio_venta AS price,
+                    imagen_url AS image_url
+                FROM productos
+                WHERE codigo_barr = ?
+                  AND (activo = 1 OR activo IS NULL)
+                """,
+                (barcode,)
+            )
+            return cur.fetchone()
+
+    def list_products(self, search: str = ""):
+        """
+        Listado de productos desde tabla productos, con alias compatibles.
+        """
+        with self._get_conn() as conn:
+            if search:
+                pattern = f"%{search}%"
+                cur = conn.execute(
+                    """
+                    SELECT
+                        id,
+                        descripcion AS name,
+                        descripcion AS description,
+                        codigo_barr AS barcode,
+                        precio_venta AS price,
+                        imagen_url AS image_url
+                    FROM productos
+                    WHERE (descripcion LIKE ? OR CAST(codigo_barr AS TEXT) LIKE ?)
+                      AND (activo = 1 OR activo IS NULL)
+                    ORDER BY descripcion
+                    """,
+                    (pattern, pattern),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT
+                        id,
+                        descripcion AS name,
+                        descripcion AS description,
+                        codigo_barr AS barcode,
+                        precio_venta AS price,
+                        imagen_url AS image_url
+                    FROM productos
+                    WHERE (activo = 1 OR activo IS NULL)
+                    ORDER BY descripcion
+                    """
+                )
+            return cur.fetchall()
+
+    # ---- Carrito (carts / cart_items) ----
+
+    def create_cart(self, cashier_id: int) -> int:
+        now = datetime.datetime.now().isoformat(sep=" ", timespec="seconds")
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO carts (cashier_id, status, created_at)
+                VALUES (?,?,?)
+                """,
+                (cashier_id, "open", now),
+            )
+            return cur.lastrowid
+
+    def add_item_to_cart(self, cart_id: int, product_id: int, quantity: int, unit_price: float):
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            # Si ya existe ítem de ese producto, solo sumamos cantidad
+            cur.execute(
+                """
+                SELECT id, quantity FROM cart_items
+                WHERE cart_id = ? AND product_id = ?
+                """,
+                (cart_id, product_id),
+            )
+            existing = cur.fetchone()
+            if existing:
+                new_qty = existing["quantity"] + quantity
+                cur.execute(
+                    "UPDATE cart_items SET quantity = ? WHERE id = ?",
+                    (new_qty, existing["id"]),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO cart_items (cart_id, product_id, quantity, unit_price)
+                    VALUES (?,?,?,?)
+                    """,
+                    (cart_id, product_id, quantity, unit_price),
+                )
+
+    def remove_cart_item(self, cart_item_id: int):
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM cart_items WHERE id = ?", (cart_item_id,))
+
+    def get_cart_items(self, cart_id: int):
+        """
+        Devuelve ítems del carrito + datos de producto (tabla productos).
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                SELECT
+                    ci.id,
+                    ci.product_id,
+                    ci.quantity,
+                    ci.unit_price,
+                    p.descripcion AS name,
+                    p.codigo_barr AS barcode
+                FROM cart_items ci
+                JOIN productos p ON p.id = ci.product_id
+                WHERE ci.cart_id = ?
+                """,
+                (cart_id,),
+            )
+            return cur.fetchall()
+
+    def close_cart(self, cart_id: int):
+        now = datetime.datetime.now().isoformat(sep=" ", timespec="seconds")
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE carts
+                SET status = 'closed', closed_at = ?
+                WHERE id = ?
+                """,
+                (now, cart_id),
+            )
+
+    # ---- Registrar venta real en tus tablas ventas / detalle_ventas ----
+
+    def create_sale_from_cart(self, cart_id: int, caja_numero: int | None = None) -> int | None:
+        """
+        Toma los ítems del carrito y crea:
+        - una fila en ventas
+        - varias filas en detalle_ventas
+        Usando tus tablas: usuarios, cajas, aperturas_caja, ventas, detalle_ventas.
+        """
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+
+            items = self.get_cart_items(cart_id)
+            if not items:
+                return None
+
+            # Total del carrito
+            subtotal = 0
+            for it in items:
+                subtotal += float(it["quantity"]) * float(it["unit_price"])
+
+            # Usuario (primer usuario activo)
+            cur.execute(
+                "SELECT id FROM usuarios WHERE activo = 1 ORDER BY id LIMIT 1"
+            )
+            row_user = cur.fetchone()
+            if row_user is None:
+                raise RuntimeError("No hay usuarios activos en la tabla 'usuarios'.")
+            usuario_id = row_user["id"]
+
+            # Caja: intentamos usar el número escaneado
+            row_caja = None
+            if caja_numero is not None:
+                cur.execute(
+                    "SELECT id FROM cajas WHERE numero = ? ORDER BY id LIMIT 1",
+                    (caja_numero,),
+                )
+                row_caja = cur.fetchone()
+
+            if row_caja is None:
+                cur.execute("SELECT id FROM cajas ORDER BY id LIMIT 1")
+                row_caja = cur.fetchone()
+
+            if row_caja is None:
+                raise RuntimeError("No hay cajas definidas en la tabla 'cajas'.")
+
+            caja_id = row_caja["id"]
+
+            # Apertura de caja abierta para esa caja (o crear una)
+            cur.execute(
+                """
+                SELECT id FROM aperturas_caja
+                WHERE caja_id = ? AND estado = 'abierta'
+                ORDER BY fecha_apertura DESC
+                LIMIT 1
+                """,
+                (caja_id,),
+            )
+            row_ap = cur.fetchone()
+            if row_ap is None:
+                cur.execute(
+                    """
+                    INSERT INTO aperturas_caja (caja_id, usuario_id, monto_inicial, estado)
+                    VALUES (?,?,0,'abierta')
+                    """,
+                    (caja_id, usuario_id),
+                )
+                apertura_id = cur.lastrowid
+            else:
+                apertura_id = row_ap["id"]
+
+            # Generar número de ticket
+            numero_ticket = datetime.datetime.now().strftime("M%Y%m%d%H%M%S")
+
+            # Insertar venta
+            cur.execute(
+                """
+                INSERT INTO ventas (
+                    numero_ticket, caja_id, usuario_id, apertura_id,
+                    cliente_nombre, cliente_ruc,
+                    subtotal, descuento, iva, total,
+                    forma_pago, estado
+                )
+                VALUES (?,?,?,?,NULL,NULL, ?,0,0,?,'efectivo','completada')
+                """,
+                (
+                    numero_ticket,
+                    caja_id,
+                    usuario_id,
+                    apertura_id,
+                    subtotal,
+                    subtotal,
+                ),
+            )
+            venta_id = cur.lastrowid
+
+            # Insertar detalle_ventas (disparará triggers de stock y totales)
+            for it in items:
+                cantidad = float(it["quantity"])
+                precio = float(it["unit_price"])
+                sub = cantidad * precio
+                cur.execute(
+                    """
+                    INSERT INTO detalle_ventas (
+                        venta_id, producto_id, cantidad, precio_unitario, subtotal
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        venta_id,
+                        it["product_id"],
+                        cantidad,
+                        precio,
+                        sub,
+                    ),
+                )
+
+            conn.commit()
+            return venta_id
+
+
+# ================== ESTADO GLOBAL SENCILLO ==================
+
+
+class AppState:
+    def __init__(self, db: Database):
+        self.db = db
+        self.cash_register = None  # Row de la caja (cash_registers)
+        self.cart_id: int | None = None
+        self.qr_scanning = False
+        self.barcode_scanning = False   # escáner de barras
+
+
+# ================== UI EN FLET ==================
+
 
 def main(page: ft.Page):
-    # Configuración de la página
-    page.title = "Supermercado X"
+    page.title = "Mobile Cart - Supermarket"
+    page.vertical_alignment = ft.MainAxisAlignment.START
+    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.padding = 0
-    
-    # Variables de estado
-    current_view = "qr_reader"
-    camera_active = False
-    cap = None
-    shopping_cart = []
-    
-    def login_successful(e=None):
-        nonlocal current_view, camera_active, cap
-        current_view = "main_app"
-        
-        # Detener cámara si está activa
-        if camera_active:
-            camera_active = False
-            if cap is not None:
-                cap.release()
-                cv2.destroyAllWindows()
-        
-        show_main_app()
-    
-    def show_qr_reader():
-        nonlocal current_view, camera_active, cap
-        current_view = "qr_reader"
-        page.controls.clear()
-        camera_active = False
-        
-        # Detener cámara si estaba activa
-        if cap is not None:
-            cap.release()
-            cv2.destroyAllWindows()
-        
-        # Elemento para mostrar la cámara
-        camera_display = ft.Image(
-            src_base64=None,
-            width=300,
-            height=300,
-            fit=ft.ImageFit.CONTAIN,
-            border_radius=10,
-            visible=False
-        )
-        
-        def start_camera(e):
-            nonlocal camera_active, cap
-            if not camera_active:
-                try:
-                    # Intentar abrir cámara
-                    cap = cv2.VideoCapture(0)
-                    if not cap.isOpened():
-                        page.show_snack_bar(ft.SnackBar(ft.Text("❌ No se pudo acceder a la cámara")))
-                        return
-                    
-                    # Configurar resolución para móvil
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    cap.set(cv2.CAP_PROP_FPS, 30)
-                    
-                    camera_active = True
-                    start_btn.text = "Detener Cámara"
-                    start_btn.bgcolor = "#ff4444"
-                    status_text.value = "🔍 Escaneando QR... Apunta al código"
-                    status_text.color = "#4CAF50"
-                    camera_display.visible = True
-                    page.update()
-                    
-                    # Iniciar hilo para mostrar cámara y lectura de QR
-                    threading.Thread(target=update_camera_display, daemon=True).start()
-                    
-                except Exception as ex:
-                    page.show_snack_bar(ft.SnackBar(ft.Text(f"❌ Error de cámara: {str(ex)}")))
-        
-        def stop_camera():
-            nonlocal camera_active
-            camera_active = False
-            start_btn.text = "Iniciar Cámara"
-            start_btn.bgcolor = "#4CAF50"
-            status_text.value = "Cámara detenida"
-            status_text.color = "gray"
-            camera_display.visible = False
+    page.window_width = 390
+    page.window_height = 844
+
+    db = Database()
+    db.init_schema_and_seed()
+    state = AppState(db)
+
+    status_text = ft.Text("", color=ft.Colors.RED)
+
+    # Vista previa cámara QR (oculta por defecto)
+    camera_image = ft.Image(
+        width=300,
+        height=300,
+        fit=ft.ImageFit.CONTAIN,
+        border_radius=10,
+        gapless_playback=True,
+        visible=False,
+    )
+
+    # Vista previa cámara código de barras (oculta por defecto)
+    barcode_camera_image = ft.Image(
+        width=250,
+        height=250,
+        fit=ft.ImageFit.CONTAIN,
+        border_radius=10,
+        gapless_playback=True,
+        visible=False,
+    )
+
+    # ----------- PANTALLA 1: SELECCIÓN DE CAJA POR QR -----------
+
+    qr_input = ft.TextField(
+        label="QR de caja (token)",
+        hint_text="Escanea o pega el código",
+        expand=True,
+    )
+
+    def on_qr_detected(token: str):
+        qr_input.value = token
+        status_text.value = f"QR detectado: {token}"
+        page.update()
+        process_qr_token(token)
+
+    def qr_scan_thread():
+        state.qr_scanning = True
+        cap = cv2.VideoCapture(0)
+        last_data = None
+        stable_count = 0
+
+        if not cap.isOpened():
+            status_text.value = "No se pudo abrir la cámara."
             page.update()
-        
-        def update_camera_display():
-            nonlocal camera_active
-            while camera_active:
-                try:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    # Redimensionar frame para móvil
-                    frame = cv2.resize(frame, (300, 300))
-                    
-                    # Dibujar rectángulo de escaneo
-                    height, width = frame.shape[:2]
-                    center_x, center_y = width // 2, height // 2
-                    scan_size = 200
-                    
-                    # Rectángulo de escaneo en el centro
-                    cv2.rectangle(frame, 
-                                (center_x - scan_size//2, center_y - scan_size//2),
-                                (center_x + scan_size//2, center_y + scan_size//2),
-                                (0, 255, 0), 2)
-                    
-                    # Convertir frame a base64 para mostrar en Flet
-                    _, buffer = cv2.imencode('.jpg', frame)
-                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                    
-                    # Actualizar imagen en la UI
-                    camera_display.src_base64 = frame_base64
-                    page.update()
-                    
-                    # Decodificar QR (solo en el área de escaneo)
-                    try:
-                        # Recortar área de escaneo
-                        scan_area = frame[center_y-scan_size//2:center_y+scan_size//2, 
-                                        center_x-scan_size//2:center_x+scan_size//2]
-                        
-                        decoded_objects = decode(scan_area)
-                        for obj in decoded_objects:
-                            qr_data = obj.data.decode('utf-8')
-                            print(f"QR detectado: {qr_data}")
-                            
-                            # Dibujar resultado en el frame
-                            cv2.putText(frame, "✅ QR DETECTADO", (50, 50), 
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            
-                            # Actualizar frame final
-                            _, final_buffer = cv2.imencode('.jpg', frame)
-                            final_base64 = base64.b64encode(final_buffer).decode('utf-8')
-                            camera_display.src_base64 = final_base64
-                            page.update()
-                            
-                            # Detener cámara y procesar QR
-                            time.sleep(1)  # Mostrar confirmación por 1 segundo
-                            stop_camera()
-                            page.show_snack_bar(ft.SnackBar(ft.Text(f"✅ QR detectado: {qr_data}")))
-                            process_qr_data(qr_data)
-                            return
-                    
-                    except Exception as qr_error:
-                        print(f"Error en decodificación QR: {qr_error}")
-                    
-                    time.sleep(0.03)  # ~30 FPS
-                    
-                except Exception as ex:
-                    print(f"Error en actualización de cámara: {ex}")
-                    break
-        
-        # Elementos de la UI
-        status_text = ft.Text("Presiona 'Iniciar Cámara' para escanear QR", 
-                             size=16, color="gray", text_align=ft.TextAlign.CENTER)
-        
-        start_btn = ft.ElevatedButton(
-            "Iniciar Cámara",
-            icon=ft.Icons.CAMERA_ALT,
-            on_click=start_camera,
-            bgcolor="#4CAF50",
-            color="white",
-            width=200
-        )
-        
-        qr_content = ft.Container(
-            content=ft.Column([
-                ft.Icon(ft.Icons.QR_CODE_SCANNER, size=80, color="#4CAF50"),
-                ft.Text("Escanear QR del Carrito", size=22, weight=ft.FontWeight.BOLD, 
-                       text_align=ft.TextAlign.CENTER),
-                ft.Container(height=10),
-                status_text,
-                ft.Container(height=20),
-                
-                # Contenedor de la cámara
-                ft.Container(
-                    content=camera_display,
-                    alignment=ft.alignment.center,
-                    bgcolor="#f5f5f5",
-                    border_radius=10,
-                    padding=10,
-                    border=ft.border.all(2, "#e0e0e0")
-                ),
-                ft.Container(height=20),
-                
-                # Botones
-                start_btn,
-                ft.Container(height=20),
-                
-                ft.Row([
-                    ft.TextButton(
-                        "Código Manual",
-                        icon=ft.Icons.KEYBOARD,
-                        on_click=show_manual_input
-                    ),
-                    ft.TextButton(
-                        "Demo Rápida",
-                        icon=ft.Icons.FLASH_ON,
-                        on_click=lambda e: login_successful()
-                    )
-                ], alignment=ft.MainAxisAlignment.CENTER),
-                
-                ft.Container(height=20),
-                ft.Text("Nota: Apunta el código QR al cuadro verde de escaneo", 
-                       size=12, color="gray", text_align=ft.TextAlign.CENTER),
-                ft.Text("La app solicitará permisos de cámara automáticamente", 
-                       size=12, color="gray", text_align=ft.TextAlign.CENTER)
-                
-            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, 
-               alignment=ft.MainAxisAlignment.CENTER,
-               scroll=ft.ScrollMode.ADAPTIVE),
-            padding=20,
-            alignment=ft.alignment.center,
-            expand=True
-        )
-        
-        page.add(qr_content)
-    
-    def show_manual_input(e=None):
-        def submit_code(e):
-            code = code_field.value.strip()
-            if code:
-                process_qr_data(f"carrito_{code}")
-                page.close(manual_dialog)
-            else:
-                page.show_snack_bar(ft.SnackBar(ft.Text("❌ Ingresa un código válido")))
-        
-        code_field = ft.TextField(
-            label="Código del carrito",
-            hint_text="Ej: CAR12345",
-            width=250,
-            autofocus=True,
-            on_submit=submit_code
-        )
-        
-        manual_dialog = ft.AlertDialog(
-            title=ft.Text("Ingresar Código Manualmente"),
-            content=ft.Column([
-                ft.Text("Si no puedes escanear el QR, ingresa el código del carrito:"),
-                ft.Container(height=10),
-                code_field
-            ], tight=True),
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda e: page.close(manual_dialog)),
-                ft.ElevatedButton("Aceptar", on_click=submit_code, bgcolor="#4CAF50")
-            ],
-            actions_alignment=ft.MainAxisAlignment.END
-        )
-        
-        page.open(manual_dialog)
-    
-    def process_qr_data(qr_data):
-        """Procesa los datos del QR escaneado"""
-        qr_data_lower = qr_data.lower()
-        
-        # Verificar si es un QR válido de carrito
-        if any(keyword in qr_data_lower for keyword in ['carrito', 'cart', 'user', 'usuario', 'client', 'shopping']):
-            page.show_snack_bar(ft.SnackBar(ft.Text(f"✅ Carrito asignado: {qr_data}")))
-            login_successful()
-        else:
-            page.show_snack_bar(ft.SnackBar(ft.Text("❌ QR no válido. Debe ser de un carrito.")))
-    
-    def logout(e):
-        nonlocal current_view
-        current_view = "qr_reader"
-        page.drawer.open = False
-        page.update()
-        show_qr_reader()
+            state.qr_scanning = False
+            camera_image.visible = False
+            camera_image.update()
+            return
 
-    # Funciones del drawer principal
-    def open_drawer(e):
-        page.drawer.open = True
-        page.update()
-    
-    def menu_item_clicked(e):
-        item = e.control.data
-        page.drawer.open = False
-        page.update()
-        
-        if item == "Escaner de Productos":
-            show_barcode_scanner()
-        elif item == "Mi Carrito":
-            show_cart()
-        elif item == "Inicio":
-            show_main_app()
-        elif item == "Cerrar Sesión":
-            logout(None)
-        else:
-            page.show_snack_bar(ft.SnackBar(ft.Text(f"Seleccionado: {item}")))
+        while state.qr_scanning:
+            ret, frame = cap.read()
+            if not ret:
+                status_text.value = "No se pudo leer la cámara."
+                page.update()
+                break
 
-    def show_main_app():
-        page.controls.clear()
-        
-        # HEADER PRINCIPAL
-        header = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.IconButton(
-                        icon=ft.Icons.MENU,
-                        icon_color="white",
-                        on_click=open_drawer,
-                        tooltip="Menú"
-                    ),
-                    ft.Text(
-                        "Supermercado X", 
-                        size=20, 
-                        weight=ft.FontWeight.BOLD, 
-                        color="white",
-                        expand=True,
-                        text_align=ft.TextAlign.CENTER
-                    ),
-                    ft.IconButton(
-                        icon=ft.Icons.SHOPPING_CART,
-                        icon_color="white",
-                        on_click=show_cart,
-                        tooltip="Mi Carrito"
-                    )
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER
+            # Mostrar preview
+            try:
+                ok, buffer = cv2.imencode(".jpg", frame)
+                if ok:
+                    img_b64 = base64.b64encode(buffer).decode("utf-8")
+                    camera_image.src_base64 = img_b64
+                    camera_image.update()
+            except Exception as ex:
+                status_text.value = f"Error mostrando cámara: {ex}"
+                page.update()
+
+            # Leer QR
+            codes = decode(frame)
+            if codes:
+                data = codes[0].data.decode("utf-8")
+                if data == last_data:
+                    stable_count += 1
+                else:
+                    last_data = data
+                    stable_count = 1
+
+                if stable_count >= 5:
+                    state.qr_scanning = False
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    camera_image.visible = False
+                    camera_image.update()
+                    on_qr_detected(data)
+                    return
+
+            cv2.waitKey(1)
+            time.sleep(0.03)
+
+        cap.release()
+        cv2.destroyAllWindows()
+        state.qr_scanning = False
+        camera_image.visible = False
+        camera_image.update()
+
+    def start_qr_scan(e):
+        if state.qr_scanning:
+            status_text.value = "Ya se está escaneando el QR..."
+            page.update()
+            return
+        status_text.value = "Apunta la cámara al código QR de la caja..."
+        camera_image.visible = True
+        camera_image.update()
+        page.update()
+        threading.Thread(target=qr_scan_thread, daemon=True).start()
+
+    def process_qr_token(token: str):
+        token = token.strip()
+        if not token:
+            status_text.value = "Ingresa o escanea un QR válido."
+            page.update()
+            return
+
+        caja = db.get_cash_register_by_qr(token)
+        if caja is None:
+            status_text.value = "No se encontró una caja activa para ese QR."
+            page.update()
+            return
+
+        state.cash_register = caja
+        state.cart_id = db.create_cart(caja["id"])
+        status_text.value = ""
+        show_cart_view()
+
+    def on_qr_continue(e):
+        process_qr_token(qr_input.value)
+
+    qr_scan_button = ft.ElevatedButton(
+        text="Escanear QR con cámara",
+        icon=ft.Icons.QR_CODE_SCANNER,
+        on_click=start_qr_scan,
+    )
+
+    qr_continue_button = ft.FilledButton(
+        text="Continuar",
+        icon=ft.Icons.ARROW_FORWARD,
+        on_click=on_qr_continue,
+    )
+
+    qr_view = ft.Column(
+        [
+            ft.Text(
+                "Sistema de carrito móvil",
+                style=ft.TextThemeStyle.HEADLINE_MEDIUM,
+                text_align=ft.TextAlign.CENTER,
             ),
-            bgcolor="#4CAF50",
-            padding=ft.padding.symmetric(horizontal=10, vertical=5),
-            height=60
+            ft.Text(
+                "Escaneá el QR de la caja para comenzar tu compra.",
+                text_align=ft.TextAlign.CENTER,
+            ),
+            camera_image,
+            qr_input,
+            qr_scan_button,
+            qr_continue_button,
+            status_text,
+        ],
+        alignment=ft.MainAxisAlignment.START,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        expand=True,
+    )
+
+    # ----------- PANTALLA 2: CARRITO -----------
+
+    barcode_input = ft.TextField(
+        label="Código de barras",
+        hint_text="Escanear o escribir código de barras",
+        expand=True,
+    )
+
+    cart_rows: list[ft.DataRow] = []
+    cart_table = ft.DataTable(
+        columns=[
+            ft.DataColumn(ft.Text("Producto")),
+            ft.DataColumn(ft.Text("Cant.")),
+            ft.DataColumn(ft.Text("P. Unit.")),
+            ft.DataColumn(ft.Text("Subtotal")),
+            ft.DataColumn(ft.Text("Acciones")),
+        ],
+        rows=cart_rows,
+        column_spacing=10,
+        heading_row_height=32,
+        data_row_min_height=32,
+    )
+
+    total_text = ft.Text(
+        "Total: 0 Gs.",
+        style=ft.TextThemeStyle.TITLE_MEDIUM,
+        weight=ft.FontWeight.BOLD,
+    )
+
+    def on_delete_cart_item(cart_item_id: int):
+        if state.cart_id is None:
+            return
+        db.remove_cart_item(cart_item_id)
+        refresh_cart_table()
+
+    def refresh_cart_table():
+        if state.cart_id is None:
+            return
+        items = db.get_cart_items(state.cart_id)
+        cart_table.rows.clear()
+        total = 0.0
+        for it in items:
+            subtotal = float(it["quantity"]) * float(it["unit_price"])
+            total += subtotal
+            cart_item_id = it["id"]
+            cart_table.rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(it["name"])),
+                        ft.DataCell(ft.Text(str(it["quantity"]))),
+                        ft.DataCell(ft.Text(f"{it['unit_price']:,.2f}")),
+                        ft.DataCell(ft.Text(f"{subtotal:,.2f}")),
+                        ft.DataCell(
+                            ft.IconButton(
+                                icon=ft.Icons.DELETE,
+                                tooltip="Eliminar",
+                                on_click=lambda e, cid=cart_item_id: on_delete_cart_item(
+                                    cid
+                                ),
+                            )
+                        ),
+                    ]
+                )
+            )
+        total_text.value = f"Total: {total:,.2f} Gs."
+        page.update()
+
+    def add_product_to_cart(product_row, qty: int = 1):
+        if state.cart_id is None:
+            status_text.value = "No hay un carrito activo."
+            page.update()
+            return
+        db.add_item_to_cart(
+            state.cart_id,
+            product_row["id"],
+            qty,
+            float(product_row["price"]),
         )
-        
-        # DRAWER - SIMPLIFICADO Y FUNCIONAL
-        page.drawer = ft.NavigationDrawer(
-            controls=[
-                ft.NavigationDrawerDestination(
-                    icon=ft.Icons.HOME,
-                    label="Inicio",
+        status_text.value = f"Se agregó {product_row['name']} x{qty}."
+        refresh_cart_table()
+
+    def on_add_by_barcode(e):
+        code = barcode_input.value.strip()
+        if not code:
+            status_text.value = "Ingresa un código de barras."
+            page.update()
+            return
+        prod = db.get_product_by_barcode(code)
+        if prod is None:
+            status_text.value = f"Producto no encontrado para el código {code}."
+            page.update()
+            return
+        add_product_to_cart(prod, qty=1)
+        barcode_input.value = ""
+        page.update()
+
+    # --- escáner de código de barras con cámara ---
+
+    def on_barcode_detected(code: str):
+        barcode_input.value = code
+        page.update()
+        on_add_by_barcode(None)
+
+    def barcode_scan_thread():
+        state.barcode_scanning = True
+        cap = cv2.VideoCapture(0)
+        last_data = None
+        stable_count = 0
+
+        if not cap.isOpened():
+            status_text.value = "No se pudo abrir la cámara para barras."
+            page.update()
+            state.barcode_scanning = False
+            barcode_camera_image.visible = False
+            barcode_camera_image.update()
+            return
+
+        while state.barcode_scanning:
+            ret, frame = cap.read()
+            if not ret:
+                status_text.value = "No se pudo leer la cámara (barras)."
+                page.update()
+                break
+
+            # preview
+            try:
+                ok, buffer = cv2.imencode(".jpg", frame)
+                if ok:
+                    img_b64 = base64.b64encode(buffer).decode("utf-8")
+                    barcode_camera_image.src_base64 = img_b64
+                    barcode_camera_image.update()
+            except Exception as ex:
+                status_text.value = f"Error mostrando cámara (barras): {ex}"
+                page.update()
+
+            codes = decode(frame)
+            if codes:
+                data = codes[0].data.decode("utf-8")
+                if data == last_data:
+                    stable_count += 1
+                else:
+                    last_data = data
+                    stable_count = 1
+
+                if stable_count >= 5:
+                    state.barcode_scanning = False
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    barcode_camera_image.visible = False
+                    barcode_camera_image.update()
+                    on_barcode_detected(data)
+                    return
+
+            cv2.waitKey(1)
+            time.sleep(0.03)
+
+        cap.release()
+        cv2.destroyAllWindows()
+        state.barcode_scanning = False
+        barcode_camera_image.visible = False
+        barcode_camera_image.update()
+
+    def start_barcode_scan(e):
+        if state.barcode_scanning:
+            status_text.value = "Ya se está escaneando el código de barras..."
+            page.update()
+            return
+        status_text.value = "Apunta la cámara al código de barras del producto..."
+        barcode_camera_image.visible = True
+        barcode_camera_image.update()
+        page.update()
+        threading.Thread(target=barcode_scan_thread, daemon=True).start()
+
+    add_barcode_button = ft.FilledButton(
+        text="Agregar por código de barras",
+        icon=ft.Icons.BARCODE_READER,
+        on_click=on_add_by_barcode,
+    )
+
+    scan_barcode_button = ft.OutlinedButton(
+        text="Escanear con cámara",
+        icon=ft.Icons.QR_CODE_SCANNER,
+        on_click=start_barcode_scan,
+    )
+
+    # ---- listado de productos desde BD (tabla productos) ----
+
+    def open_product_list_dialog(e):
+        search_field = ft.TextField(
+            label="Buscar producto",
+            autofocus=True,
+            on_change=lambda ev: update_product_list(ev.control.value),
+        )
+
+        product_list_column = ft.Column(
+            spacing=5,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+        def update_product_list(search_text: str = ""):
+            product_list_column.controls.clear()
+            products = db.list_products(search_text)
+            if not products:
+                product_list_column.controls.append(
+                    ft.Text("No se encontraron productos.", italic=True)
+                )
+            else:
+                for p in products:
+                    tile = ft.ListTile(
+                        leading=ft.Image(
+                            src=p["image_url"] or "",
+                            width=40,
+                            height=40,
+                            fit=ft.ImageFit.COVER,
+                        ),
+                        title=ft.Text(p["name"]),
+                        subtitle=ft.Text(
+                            f"{p['description'] or ''}\nCod: {p['barcode']} - {p['price']:,.2f} Gs."
+                        ),
+                        trailing=ft.IconButton(
+                            icon=ft.Icons.ADD,
+                            on_click=lambda ev, prod=p: (
+                                add_product_to_cart(prod, qty=1),
+                                close_dialog()
+                            ),
+                        ),
+                    )
+                    product_list_column.controls.append(tile)
+
+            page.update()
+
+        def close_dialog(*_):
+            page.dialog.open = False
+            page.update()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Seleccionar producto"),
+            content=ft.Container(
+                content=ft.Column(
+                    [
+                        search_field,
+                        ft.Divider(),
+                        product_list_column,
+                    ],
+                    expand=True,
                 ),
-                ft.NavigationDrawerDestination(
-                    icon=ft.Icons.SHOPPING_CART,
-                    label="Mi Carrito",
+                width=350,
+                height=400,
+            ),
+            actions=[ft.TextButton("Cerrar", on_click=close_dialog)],
+        )
+
+        page.dialog = dlg
+        page.dialog.open = True
+        update_product_list("")
+        page.update()
+
+    add_from_list_button = ft.OutlinedButton(
+        text="Agregar desde listado",
+        icon=ft.Icons.LIST,
+        on_click=open_product_list_dialog,
+    )
+
+    def on_finish_cart(e):
+        if state.cart_id is None:
+            status_text.value = "No hay carrito para finalizar."
+            page.update()
+            return
+
+        try:
+            caja_numero = state.cash_register["numero"] if state.cash_register else None
+            venta_id = db.create_sale_from_cart(state.cart_id, caja_numero=caja_numero)
+            if venta_id is None:
+                status_text.value = "El carrito está vacío, no se generó venta."
+                page.update()
+                return
+
+            # Cerrar carrito
+            db.close_cart(state.cart_id)
+
+            status_text.value = f"Compra finalizada. Venta registrada (ID: {venta_id})."
+            # Limpiamos estado y volvemos a pantalla de QR
+            state.cart_id = None
+            state.cash_register = None
+            show_qr_view()
+        except Exception as ex:
+            status_text.value = f"Error al registrar la venta: {ex}"
+            page.update()
+
+    finish_button = ft.FilledButton(
+        text="Finalizar compra",
+        icon=ft.Icons.CHECK_CIRCLE,
+        on_click=on_finish_cart,
+    )
+
+    def show_cart_view():
+        cashier_name = (
+            state.cash_register["nombre"] if state.cash_register else "Sin caja"
+        )
+        page.controls.clear()
+        page.appbar = ft.AppBar(
+            title=ft.Text(f"Carrito - {cashier_name}"),
+            center_title=True,
+        )
+        content = ft.Column(
+            [
+                ft.Text(
+                    "Agregá tus productos al carrito:",
+                    style=ft.TextThemeStyle.TITLE_MEDIUM,
                 ),
-                ft.NavigationDrawerDestination(
-                    icon=ft.Icons.BARCODE_READER,
-                    label="Escaner de Productos",
+                ft.Row(
+                    [barcode_input],
+                    alignment=ft.MainAxisAlignment.START,
                 ),
-                ft.NavigationDrawerDestination(
-                    icon=ft.Icons.SHOPPING_BAG,
-                    label="Productos",
+                ft.Row(
+                    [add_barcode_button, scan_barcode_button],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                barcode_camera_image,
+                ft.Row(
+                    [add_from_list_button, finish_button],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 ),
                 ft.Divider(),
-                ft.NavigationDrawerDestination(
-                    icon=ft.Icons.LOGOUT,
-                    label="Cerrar Sesión",
-                ),
-            ],
-            on_change=lambda e: menu_item_clicked_wrapper(e.control.selected_index)
-        )
-        
-        def menu_item_clicked_wrapper(selected_index):
-            items = ["Inicio", "Mi Carrito", "Escaner de Productos", "Productos", "Cerrar Sesión"]
-            if 0 <= selected_index < len(items):
-                menu_item_clicked(type('Event', (), {'control': type('Control', (), {'data': items[selected_index]})()}))
-        
-        # CONTENIDO PRINCIPAL
-        frame1 = ft.Container(
-            content=ft.Column(
-                controls=[
-                    ft.Text(
-                        "¡Bienvenido!",
-                        size=18,
-                        weight=ft.FontWeight.BOLD,
-                        color="white"
-                    ),
-                    ft.Text(
-                        "Sesión iniciada con QR",
-                        size=14,
-                        color="white"
-                    ),
-                    ft.ElevatedButton(
-                        "Comenzar a Comprar",
-                        bgcolor="white",
-                        color="#4CAF50",
-                        on_click=lambda e: show_barcode_scanner()
-                    )
-                ],
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                alignment=ft.MainAxisAlignment.CENTER
-            ),
-            gradient=ft.LinearGradient(
-                begin=ft.alignment.top_left,
-                end=ft.alignment.bottom_right,
-                colors=["#4CAF50", "#45a049"]
-            ),
-            height=150,
-            border_radius=10,
-            margin=10,
-            padding=15,
-            alignment=ft.alignment.center
-        )
-        
-        frame2 = ft.Container(
-            content=ft.Column(
-                controls=[
-                    ft.Row(
-                        controls=[
+                ft.Container(
+                    content=ft.Column(
+                        [
                             ft.Text(
-                                "Categorías",
-                                size=18,
-                                weight=ft.FontWeight.BOLD,
-                                expand=True
+                                "Productos en el carrito:",
+                                style=ft.TextThemeStyle.TITLE_SMALL,
                             ),
-                            ft.TextButton(
-                                "Ver todas",
-                                on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Todas las categorías")))
-                            )
+                            ft.Container(
+                                content=cart_table,
+                                expand=True,
+                            ),
                         ],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN
+                        expand=True,
                     ),
-                    ft.Row(
-                        controls=[
-                            ft.Container(
-                                content=ft.Column(
-                                    controls=[
-                                        ft.Icon(ft.Icons.KITCHEN, size=40, color="#4CAF50"),
-                                        ft.Text("Despensa", size=12, text_align=ft.TextAlign.CENTER)
-                                    ],
-                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    spacing=5
-                                ),
-                                padding=10,
-                                width=80,
-                                height=80,
-                                bgcolor="white",
-                                border_radius=10,
-                                on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Despensa")))
-                            ),
-                            ft.Container(
-                                content=ft.Column(
-                                    controls=[
-                                        ft.Icon(ft.Icons.LOCAL_DRINK, size=40, color="#4CAF50"),
-                                        ft.Text("Bebidas", size=12, text_align=ft.TextAlign.CENTER)
-                                    ],
-                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    spacing=5
-                                ),
-                                padding=10,
-                                width=80,
-                                height=80,
-                                bgcolor="white",
-                                border_radius=10,
-                                on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Bebidas")))
-                            ),
-                            ft.Container(
-                                content=ft.Column(
-                                    controls=[
-                                        ft.Icon(ft.Icons.KITCHEN, size=40, color="#4CAF50"),
-                                        ft.Text("Lácteos", size=12, text_align=ft.TextAlign.CENTER)
-                                    ],
-                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    spacing=5
-                                ),
-                                padding=10,
-                                width=80,
-                                height=80,
-                                bgcolor="white",
-                                border_radius=10,
-                                on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Lácteos")))
-                            ),
-                        ],
-                        scroll=ft.ScrollMode.AUTO,
-                        spacing=10
-                    )
-                ],
-                spacing=15
-            ),
-            bgcolor="white",
-            padding=15,
-            margin=10,
-            border_radius=10
-        )
-        
-        main_content = ft.ListView(
-            controls=[
-                frame1,
-                frame2
+                    expand=True,
+                ),
+                total_text,
+                status_text,
             ],
             expand=True,
-            spacing=0,
-            padding=0
         )
-        
-        page.add(
-            ft.Column(
-                controls=[
-                    header,
-                    main_content
-                ],
-                expand=True,
-                spacing=0
-            )
-        )
+        page.controls.append(content)
+        refresh_cart_table()
+        page.update()
 
-    def show_barcode_scanner(e=None):
-        """Muestra el escáner de código de barras"""
-        nonlocal camera_active, cap, current_view
-        current_view = "barcode_scanner"
+    def show_qr_view():
         page.controls.clear()
-        camera_active = False
-        
-        # Detener cámara si estaba activa
-        if cap is not None:
-            cap.release()
-            cv2.destroyAllWindows()
-        
-        # Elemento para mostrar la cámara
-        camera_display = ft.Image(
-            src_base64=None,
-            width=350,
-            height=300,
-            fit=ft.ImageFit.CONTAIN,
-            border_radius=10,
-            visible=False
+        page.appbar = ft.AppBar(
+            title=ft.Text("Seleccionar caja"),
+            center_title=True,
         )
-        
-        # Lista de productos escaneados
-        scanned_products = ft.Column(
-            scroll=ft.ScrollMode.ADAPTIVE,
-            expand=True
-        )
-        
-        # Base de datos simulada de productos
-        product_database = {
-            "123456789012": {"nombre": "Leche Entera 1L", "precio": 2.50, "categoria": "Lácteos"},
-            "234567890123": {"nombre": "Pan Integral", "precio": 1.80, "categoria": "Panadería"},
-            "345678901234": {"nombre": "Arroz 1kg", "precio": 3.20, "categoria": "Despensa"},
-            "456789012345": {"nombre": "Agua Mineral 500ml", "precio": 1.00, "categoria": "Bebidas"},
-            "567890123456": {"nombre": "Jabón Líquido", "precio": 4.50, "categoria": "Limpieza"},
-            "678901234567": {"nombre": "Cereal Maíz", "precio": 3.80, "categoria": "Despensa"},
-            "789012345678": {"nombre": "Yogurt Natural", "precio": 2.20, "categoria": "Lácteos"},
-            "890123456789": {"nombre": "Galletas Chocolate", "precio": 2.80, "categoria": "Snacks"},
-            "901234567890": {"nombre": "Aceite Oliva 500ml", "precio": 6.50, "categoria": "Despensa"},
-            "012345678901": {"nombre": "Refresco Cola 330ml", "precio": 1.50, "categoria": "Bebidas"}
-        }
-        
-        def start_barcode_scan(e):
-            nonlocal camera_active, cap
-            if not camera_active:
-                try:
-                    # Intentar abrir cámara
-                    cap = cv2.VideoCapture(0)
-                    if not cap.isOpened():
-                        page.show_snack_bar(ft.SnackBar(ft.Text("❌ No se pudo acceder a la cámara")))
-                        return
-                    
-                    # Configurar resolución
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    cap.set(cv2.CAP_PROP_FPS, 30)
-                    
-                    camera_active = True
-                    start_btn.text = "Detener Escaneo"
-                    start_btn.bgcolor = "#ff4444"
-                    status_text.value = "🔍 Escaneando códigos de barras..."
-                    status_text.color = "#2196F3"
-                    camera_display.visible = True
-                    page.update()
-                    
-                    # Iniciar hilo para mostrar cámara y lectura de códigos de barras
-                    threading.Thread(target=update_barcode_display, daemon=True).start()
-                    
-                except Exception as ex:
-                    page.show_snack_bar(ft.SnackBar(ft.Text(f"❌ Error de cámara: {str(ex)}")))
-            else:
-                stop_barcode_scan()
-        
-        def stop_barcode_scan():
-            nonlocal camera_active
-            camera_active = False
-            start_btn.text = "Iniciar Escaneo"
-            start_btn.bgcolor = "#2196F3"
-            status_text.value = "Escáner detenido"
-            status_text.color = "gray"
-            camera_display.visible = False
-            page.update()
-        
-        def update_barcode_display():
-            nonlocal camera_active
-            last_scanned_time = 0
-            scan_cooldown = 2  # segundos entre escaneos
-            
-            while camera_active:
-                try:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    # Redimensionar frame
-                    frame = cv2.resize(frame, (350, 300))
-                    
-                    # Dibujar línea de escaneo en el centro
-                    height, width = frame.shape[:2]
-                    cv2.line(frame, (0, height//2), (width, height//2), (0, 255, 0), 2)
-                    
-                    # Convertir frame a base64 para mostrar en Flet
-                    _, buffer = cv2.imencode('.jpg', frame)
-                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                    
-                    # Actualizar imagen en la UI
-                    camera_display.src_base64 = frame_base64
-                    
-                    # Decodificar códigos de barras
-                    current_time = time.time()
-                    if current_time - last_scanned_time > scan_cooldown:
-                        try:
-                            decoded_objects = decode(frame)
-                            for obj in decoded_objects:
-                                barcode_data = obj.data.decode('utf-8')
-                                print(f"Código de barras detectado: {barcode_data}")
-                                
-                                # Dibujar resultado en el frame
-                                cv2.putText(frame, "✅ PRODUCTO DETECTADO", (30, 30), 
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                                
-                                # Actualizar frame final
-                                _, final_buffer = cv2.imencode('.jpg', frame)
-                                final_base64 = base64.b64encode(final_buffer).decode('utf-8')
-                                camera_display.src_base64 = final_base64
-                                
-                                # Procesar código de barras
-                                process_barcode(barcode_data)
-                                last_scanned_time = current_time
-                                break
-                        
-                        except Exception as barcode_error:
-                            print(f"Error en decodificación: {barcode_error}")
-                    
-                    page.update()
-                    time.sleep(0.03)  # ~30 FPS
-                    
-                except Exception as ex:
-                    print(f"Error en actualización de cámara: {ex}")
-                    break
-        
-        def process_barcode(barcode_data):
-            """Procesa el código de barras escaneado"""
-            if barcode_data in product_database:
-                product = product_database[barcode_data]
-                
-                # Verificar si el producto ya está en el carrito
-                existing_item = next((item for item in shopping_cart if item["codigo"] == barcode_data), None)
-                
-                if existing_item:
-                    existing_item["cantidad"] += 1
-                else:
-                    # Agregar producto al carrito
-                    shopping_cart.append({
-                        "codigo": barcode_data,
-                        "nombre": product["nombre"],
-                        "precio": product["precio"],
-                        "cantidad": 1
-                    })
-                
-                # Mostrar notificación
-                page.show_snack_bar(ft.SnackBar(
-                    ft.Text(f"✅ {product['nombre']} - ${product['precio']} agregado al carrito")
-                ))
-                
-                # Actualizar lista de productos escaneados
-                update_scanned_products_list()
-                
-            else:
-                page.show_snack_bar(ft.SnackBar(
-                    ft.Text(f"❌ Producto no encontrado: {barcode_data}")
-                ))
-        
-        def update_scanned_products_list():
-            """Actualiza la lista de productos escaneados"""
-            scanned_products.controls.clear()
-            
-            if shopping_cart:
-                total = 0
-                for item in shopping_cart:
-                    product_card = ft.Card(
-                        content=ft.Container(
-                            content=ft.Column([
-                                ft.Row([
-                                    ft.Text(item["nombre"], size=16, weight=ft.FontWeight.BOLD, expand=True),
-                                    ft.Text(f"${item['precio']:.2f}", size=16, color="green"),
-                                ]),
-                                ft.Row([
-                                    ft.Text(f"Código: {item['codigo']}", size=12, color="gray"),
-                                    ft.Text(f"Cantidad: x{item['cantidad']}", size=14),
-                                ])
-                            ]),
-                            padding=10
-                        ),
-                        margin=5
-                    )
-                    scanned_products.controls.append(product_card)
-                    total += item["precio"] * item["cantidad"]
-                
-                # Agregar total
-                scanned_products.controls.append(
-                    ft.Container(
-                        content=ft.Row([
-                            ft.Text("Total:", size=18, weight=ft.FontWeight.BOLD),
-                            ft.Text(f"${total:.2f}", size=18, color="green", weight=ft.FontWeight.BOLD),
-                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                        padding=10,
-                        bgcolor="#e8f5e8",
-                        border_radius=5
-                    )
-                )
-            else:
-                scanned_products.controls.append(
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Icon(ft.Icons.SCANNER, size=50, color="gray"),
-                            ft.Text("No hay productos escaneados", size=16, color="gray"),
-                            ft.Text("Escanea códigos de barras para agregar productos", size=14, color="gray"),
-                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                        padding=20,
-                        alignment=ft.alignment.center
-                    )
-                )
-            
-            page.update()
-        
-        def manual_add_product(e):
-            """Agregar producto manualmente"""
-            def submit_manual(e):
-                barcode = manual_code_field.value.strip()
-                if barcode:
-                    process_barcode(barcode)
-                    page.close(manual_dialog)
-                else:
-                    page.show_snack_bar(ft.SnackBar(ft.Text("❌ Ingresa un código válido")))
-            
-            manual_code_field = ft.TextField(
-                label="Código de barras",
-                hint_text="Ej: 123456789012",
-                width=250,
-                autofocus=True,
-                on_submit=submit_manual
-            )
-            
-            manual_dialog = ft.AlertDialog(
-                title=ft.Text("Agregar Producto Manualmente"),
-                content=ft.Column([
-                    ft.Text("Ingresa el código de barras del producto:"),
-                    ft.Container(height=10),
-                    manual_code_field,
-                    ft.Container(height=10),
-                    ft.Text("Códigos de ejemplo:", size=12, color="gray"),
-                    ft.Text("123456789012 - Leche", size=12, color="gray"),
-                    ft.Text("234567890123 - Pan", size=12, color="gray"),
-                ], tight=True),
-                actions=[
-                    ft.TextButton("Cancelar", on_click=lambda e: page.close(manual_dialog)),
-                    ft.ElevatedButton("Agregar", on_click=submit_manual, bgcolor="#2196F3")
-                ],
-                actions_alignment=ft.MainAxisAlignment.END
-            )
-            
-            page.open(manual_dialog)
-        
-        # Elementos de la UI
-        status_text = ft.Text("Presiona 'Iniciar Escaneo' para escanear productos", 
-                             size=16, color="gray", text_align=ft.TextAlign.CENTER)
-        
-        start_btn = ft.ElevatedButton(
-            "Iniciar Escaneo",
-            icon=ft.Icons.CAMERA_ALT,
-            on_click=start_barcode_scan,
-            bgcolor="#2196F3",
-            color="white",
-            width=200
-        )
-        
-        # Header
-        header = ft.Container(
-            content=ft.Row([
-                ft.IconButton(
-                    icon=ft.Icons.ARROW_BACK, 
-                    icon_color="white", 
-                    on_click=lambda _: show_main_app()
-                ),
-                ft.Text("Escáner de Productos", size=20, weight=ft.FontWeight.BOLD, color="white", expand=True, text_align=ft.TextAlign.CENTER),
-                ft.Container(
-                    content=ft.Row([
-                        ft.Icon(ft.Icons.SHOPPING_CART, color="white", size=20),
-                        ft.Container(
-                            content=ft.Text(str(len(shopping_cart)), color="white", size=12, weight=ft.FontWeight.BOLD),
-                            bgcolor="#ff4444",
-                            border_radius=10,
-                            padding=ft.padding.symmetric(horizontal=6, vertical=2)
-                        )
-                    ]),
-                    on_click=show_cart,
-                    tooltip="Ver Carrito"
-                )
-            ]),
-            bgcolor="#2196F3",
-            padding=10,
-            height=60
-        )
-        
-        # Contenido principal
-        scanner_content = ft.Container(
-            content=ft.Column([
-                # Sección del escáner
-                ft.Container(
-                    content=ft.Column([
-                        ft.Icon(ft.Icons.BARCODE_READER, size=60, color="#2196F3"),
-                        ft.Text("Escáner de Códigos de Barras", size=22, weight=ft.FontWeight.BOLD, 
-                               text_align=ft.TextAlign.CENTER),
-                        ft.Container(height=10),
-                        status_text,
-                        ft.Container(height=20),
-                        
-                        # Contenedor de la cámara
-                        ft.Container(
-                            content=camera_display,
-                            alignment=ft.alignment.center,
-                            bgcolor="#f5f5f5",
-                            border_radius=10,
-                            padding=10,
-                            border=ft.border.all(2, "#e0e0e0")
-                        ),
-                        ft.Container(height=20),
-                        
-                        # Botones de control
-                        ft.Row([
-                            start_btn,
-                        ], alignment=ft.MainAxisAlignment.CENTER),
-                        
-                        ft.Container(height=10),
-                        ft.Row([
-                            ft.TextButton(
-                                "Agregar Manualmente",
-                                icon=ft.Icons.KEYBOARD,
-                                on_click=manual_add_product
-                            ),
-                            ft.TextButton(
-                                "Limpiar Lista",
-                                icon=ft.Icons.CLEAR_ALL,
-                                on_click=lambda e: (shopping_cart.clear(), update_scanned_products_list())
-                            )
-                        ], alignment=ft.MainAxisAlignment.CENTER),
-                        
-                        ft.Container(height=20),
-                        ft.Text("Nota: Apunta el código de barras a la línea verde de escaneo", 
-                               size=12, color="gray", text_align=ft.TextAlign.CENTER),
-                    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                    padding=20
-                ),
-                
-                # Lista de productos escaneados
-                ft.Container(
-                    content=ft.Column([
-                        ft.Row([
-                            ft.Text("Productos Escaneados", size=18, weight=ft.FontWeight.BOLD, expand=True),
-                            ft.Container(
-                                content=ft.Text(str(len(shopping_cart)), color="white", size=14, weight=ft.FontWeight.BOLD),
-                                bgcolor="#2196F3",
-                                border_radius=15,
-                                padding=ft.padding.symmetric(horizontal=8, vertical=4)
-                            )
-                        ]),
-                        ft.Container(height=10),
-                        scanned_products
-                    ]),
-                    padding=20,
-                    bgcolor="white",
-                    expand=True
-                )
-                
-            ], scroll=ft.ScrollMode.ADAPTIVE),
-            expand=True
-        )
-        
-        # Inicializar lista de productos
-        update_scanned_products_list()
-        
-        page.add(
-            ft.Column(
-                controls=[
-                    header,
-                    scanner_content
-                ],
-                expand=True,
-                spacing=0
-            )
-        )
+        camera_image.visible = False
+        barcode_camera_image.visible = False
+        page.add(qr_view)
+        page.update()
 
-    def show_cart(e=None):
-        page.controls.clear()
-        
-        # Header
-        header = ft.Container(
-            content=ft.Row([
-                ft.IconButton(
-                    icon=ft.Icons.ARROW_BACK, 
-                    icon_color="white", 
-                    on_click=lambda _: show_main_app()
-                ),
-                ft.Text("Mi Carrito", size=20, weight=ft.FontWeight.BOLD, color="white", expand=True, text_align=ft.TextAlign.CENTER),
-                ft.IconButton(
-                    icon=ft.Icons.DELETE, 
-                    icon_color="white", 
-                    on_click=lambda _: vaciar_carrito()
-                ),
-            ]),
-            bgcolor="#4CAF50",
-            padding=10,
-            height=60
-        )
-        
-        # Contenido del carrito
-        if not shopping_cart:
-            contenido = ft.Column([
-                ft.Icon(ft.Icons.SHOPPING_CART_OUTLINED, size=100, color="gray"),
-                ft.Text("Carrito vacío", size=18, color="gray"),
-                ft.Text("Escanea productos para agregarlos", size=14, color="gray"),
-                ft.ElevatedButton(
-                    "Ir al Escáner",
-                    on_click=lambda e: show_barcode_scanner(),
-                    bgcolor="#2196F3",
-                    color="white"
-                )
-            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, expand=True)
-        else:
-            total = sum(item["precio"] * item["cantidad"] for item in shopping_cart)
-            contenido = ft.Column([
-                ft.ListView(
-                    controls=[
-                        ft.Card(
-                            content=ft.Container(
-                                content=ft.Column([
-                                    ft.Row([
-                                        ft.Text(item["nombre"], size=16, weight=ft.FontWeight.BOLD, expand=True),
-                                        ft.Text(f"${item['precio']:.2f}", size=16, color="green"),
-                                    ]),
-                                    ft.Row([
-                                        ft.Text(f"Código: {item['codigo']}", size=12, color="gray"),
-                                        ft.Text(f"Cantidad: x{item['cantidad']}", size=14),
-                                        ft.Row([
-                                            ft.IconButton(
-                                                icon=ft.Icons.REMOVE,
-                                                icon_size=16,
-                                                on_click=lambda e, code=item['codigo']: modificar_cantidad(code, -1)
-                                            ),
-                                            ft.IconButton(
-                                                icon=ft.Icons.ADD,
-                                                icon_size=16,
-                                                on_click=lambda e, code=item['codigo']: modificar_cantidad(code, 1)
-                                            ),
-                                        ])
-                                    ])
-                                ]),
-                                padding=10
-                            ),
-                            margin=5
-                        ) for item in shopping_cart
-                    ],
-                    expand=True
-                ),
-                ft.Container(
-                    content=ft.Column([
-                        ft.Divider(),
-                        ft.Row([
-                            ft.Text("Total:", size=20, weight=ft.FontWeight.BOLD),
-                            ft.Text(f"${total:.2f}", size=20, color="green", weight=ft.FontWeight.BOLD),
-                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                        ft.Container(height=20),
-                        ft.Row([
-                            ft.ElevatedButton(
-                                "Seguir Comprando",
-                                on_click=lambda e: show_barcode_scanner(),
-                                bgcolor="#2196F3",
-                                color="white",
-                                expand=True
-                            ),
-                            ft.ElevatedButton(
-                                "Pagar",
-                                on_click=lambda e: page.show_snack_bar(ft.SnackBar(ft.Text("Funcionalidad de pago - Próximamente"))),
-                                bgcolor="#4CAF50",
-                                color="white",
-                                expand=True
-                            ),
-                        ], spacing=10)
-                    ]),
-                    padding=20,
-                    bgcolor="#f5f5f5"
-                )
-            ])
-        
-        page.add(ft.Column([header, contenido], expand=True))
+    # Iniciar en pantalla de QR
+    show_qr_view()
 
-    def modificar_cantidad(codigo, cambio):
-        """Modifica la cantidad de un producto en el carrito"""
-        for item in shopping_cart:
-            if item["codigo"] == codigo:
-                item["cantidad"] += cambio
-                if item["cantidad"] <= 0:
-                    shopping_cart.remove(item)
-                break
-        show_cart()
 
-    def vaciar_carrito():
-        shopping_cart.clear()
-        page.show_snack_bar(ft.SnackBar(ft.Text("Carrito vaciado")))
-        show_cart()
-    
-    # Iniciar con el lector de QR
-    show_qr_reader()
-    
-# Ejecutar la aplicación
-ft.app(target=main)
+if __name__ == "__main__":
+    ft.app(target=main)
